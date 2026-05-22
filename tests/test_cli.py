@@ -16,21 +16,26 @@ _REPO_URL = "https://example.com/owner/repo.git"
 
 
 @pytest.fixture
-def captured_agent(monkeypatch, tmp_path):
-    """Run `vv <url>` with `_start_from_url` stubbed; yield the resolved agent.
+def captured(monkeypatch, tmp_path):
+    """Run `vv <url>` with `_start_from_url` stubbed; yield what it captured.
 
-    Starts from a clean slate: no `$VV_AGENT`, and `$VV_CONFIG` pointed at a
+    `run(*args)` returns a dict with the resolved `agent` and `bypass`. Starts
+    from a clean slate: no `$VV_AGENT`, and `$VV_CONFIG` pointed at a
     non-existent file so individual tests opt into env/config explicitly.
     """
-    seen: dict[str, str] = {}
-    monkeypatch.setattr(cli, "_start_from_url", lambda url, agent: seen.update(agent=agent))
+    seen: dict = {}
+    monkeypatch.setattr(
+        cli,
+        "_start_from_url",
+        lambda url, agent, bypass: seen.update(agent=agent, bypass=bypass),
+    )
     monkeypatch.delenv("VV_AGENT", raising=False)
     monkeypatch.setenv("VV_CONFIG", str(tmp_path / "missing.toml"))
 
-    def run(*args: str) -> str:
+    def run(*args: str) -> dict:
         result = runner.invoke(cli.app, [*args, _REPO_URL])
         assert result.exit_code == 0, result.output
-        return seen["agent"]
+        return seen
 
     return run
 
@@ -49,30 +54,65 @@ def test_banner_renders_the_wordmark(capsys):
     assert "◍" in out  # the branch-diagram glyph
 
 
-def test_defaults_to_claude(captured_agent):
-    assert captured_agent() == "claude"
+def test_defaults_to_claude(captured):
+    assert captured()["agent"] == "claude"
 
 
-def test_vv_agent_env_is_used(captured_agent, monkeypatch):
+def test_vv_agent_env_is_used(captured, monkeypatch):
     monkeypatch.setenv("VV_AGENT", "codex")
-    assert captured_agent() == "codex"
+    assert captured()["agent"] == "codex"
 
 
-def test_config_file_is_used_when_no_flag_or_env(captured_agent, monkeypatch, tmp_path):
+def test_config_file_is_used_when_no_flag_or_env(captured, monkeypatch, tmp_path):
     _write_config(monkeypatch, tmp_path, "gemini")
-    assert captured_agent() == "gemini"
+    assert captured()["agent"] == "gemini"
 
 
-def test_vv_agent_env_beats_config_file(captured_agent, monkeypatch, tmp_path):
-    _write_config(monkeypatch, tmp_path, "gemini")
-    monkeypatch.setenv("VV_AGENT", "codex")
-    assert captured_agent() == "codex"
-
-
-def test_agent_flag_beats_env_and_config(captured_agent, monkeypatch, tmp_path):
+def test_vv_agent_env_beats_config_file(captured, monkeypatch, tmp_path):
     _write_config(monkeypatch, tmp_path, "gemini")
     monkeypatch.setenv("VV_AGENT", "codex")
-    assert captured_agent("--agent", "claude") == "claude"
+    assert captured()["agent"] == "codex"
+
+
+def test_agent_flag_beats_env_and_config(captured, monkeypatch, tmp_path):
+    _write_config(monkeypatch, tmp_path, "gemini")
+    monkeypatch.setenv("VV_AGENT", "codex")
+    assert captured("--agent", "claude")["agent"] == "claude"
+
+
+# --- bypass / --ask resolution ----------------------------------------------
+
+def test_bypass_is_on_by_default(captured):
+    assert captured()["bypass"] is True
+
+
+def test_ask_flag_disables_bypass(captured):
+    assert captured("--ask")["bypass"] is False
+
+
+def test_no_ask_flag_keeps_bypass(captured):
+    assert captured("--no-ask")["bypass"] is True
+
+
+def test_config_ask_true_disables_bypass(captured, monkeypatch, tmp_path):
+    cfg = tmp_path / "config.toml"
+    cfg.write_text("ask = true\n")
+    monkeypatch.setenv("VV_CONFIG", str(cfg))
+    assert captured()["bypass"] is False
+
+
+def test_ask_flag_overrides_config(captured, monkeypatch, tmp_path):
+    cfg = tmp_path / "config.toml"
+    cfg.write_text("ask = false\n")  # config would bypass
+    monkeypatch.setenv("VV_CONFIG", str(cfg))
+    assert captured("--ask")["bypass"] is False  # flag wins -> ask
+
+
+def test_no_ask_flag_overrides_config(captured, monkeypatch, tmp_path):
+    cfg = tmp_path / "config.toml"
+    cfg.write_text("ask = true\n")  # config would ask
+    monkeypatch.setenv("VV_CONFIG", str(cfg))
+    assert captured("--no-ask")["bypass"] is True  # flag wins -> bypass
 
 
 # --- _delete_session safety prompt ------------------------------------------
@@ -155,3 +195,31 @@ def test_delete_does_not_kill_when_no_live_session(delete_harness, tmp_path):
     calls = delete_harness(dirty=False, unpushed=0)
     cli._delete_session("repo", "falcon", tmp_path / "wt", live=set())
     assert calls["killed"] == []
+
+
+# --- _resume_worktree bypass mode -------------------------------------------
+
+@pytest.fixture
+def sent_command(monkeypatch):
+    """Stub tmux around a fresh-session launch; yield the command it sends."""
+    sent: list[str] = []
+    monkeypatch.setattr(cli.tmux_ops, "session_exists", lambda name: False)
+    monkeypatch.setattr(cli.tmux_ops, "create_session", lambda name, cwd: None)
+    monkeypatch.setattr(cli.tmux_ops, "send_command", lambda name, cmd: sent.append(cmd))
+    monkeypatch.setattr(cli.tmux_ops, "attach", lambda name: None)
+    return sent
+
+
+def test_resume_worktree_appends_bypass_flag(sent_command, tmp_path):
+    cli._resume_worktree("falcon", tmp_path, "claude", bypass=True)
+    assert sent_command == ["claude " + cli.agents.BYPASS_FLAGS["claude"]]
+
+
+def test_resume_worktree_without_bypass_sends_bare_agent(sent_command, tmp_path):
+    cli._resume_worktree("falcon", tmp_path, "claude", bypass=False)
+    assert sent_command == ["claude"]
+
+
+def test_resume_worktree_bypass_leaves_unknown_agent_unflagged(sent_command, tmp_path):
+    cli._resume_worktree("falcon", tmp_path, "agy", bypass=True)
+    assert sent_command == ["agy"]

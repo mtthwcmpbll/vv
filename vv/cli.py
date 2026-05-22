@@ -80,18 +80,20 @@ def _pick_agent(default: str) -> str | None:
     return picked
 
 
-def _resume_worktree(name: str, worktree_path: Path, agent: str) -> None:
+def _resume_worktree(name: str, worktree_path: Path, agent: str, bypass: bool) -> None:
     """Attach to the worktree's tmux session, creating it fresh if none is live.
 
     The worktree is the session: if vv already has a tmux session of this name
     we hand the terminal to it; otherwise we start one rooted at the worktree
     and launch ``agent``, just like a brand-new session but with existing state.
+    When ``bypass`` is set, the agent is launched with permission prompts off.
     """
     if tmux_ops.session_exists(name):
         typer.secho(f"Joining live session '{name}'...", fg=typer.colors.CYAN)
     else:
+        launch = agents.with_bypass(agent) if bypass else agent
         typer.secho(
-            f"Starting tmux session '{name}' and launching {agent}...",
+            f"Starting tmux session '{name}' and launching {launch}...",
             fg=typer.colors.CYAN,
         )
         if not agents.is_installed(agent):
@@ -99,14 +101,16 @@ def _resume_worktree(name: str, worktree_path: Path, agent: str) -> None:
                 f"  warning: '{agent}' was not found on PATH", fg=typer.colors.YELLOW
             )
         tmux_ops.create_session(name, worktree_path)
-        tmux_ops.send_command(name, agent)
+        tmux_ops.send_command(name, launch)
 
     typer.secho(f"  worktree: {worktree_path}", fg=typer.colors.GREEN)
     typer.secho(f"  session:  {name}", fg=typer.colors.GREEN)
     tmux_ops.attach(name)
 
 
-def _new_worktree_session(repo_name: str, workspace: Path, agent: str) -> None:
+def _new_worktree_session(
+    repo_name: str, workspace: Path, agent: str, bypass: bool
+) -> None:
     """Create a worktree + tmux session for an already-cloned repo and attach."""
     worktree_root = config.worktrees_dir() / repo_name
 
@@ -125,10 +129,10 @@ def _new_worktree_session(repo_name: str, workspace: Path, agent: str) -> None:
     )
     git_ops.add_worktree(workspace, worktree_path, branch=name, start_ref=start_ref)
 
-    _resume_worktree(name, worktree_path, agent)
+    _resume_worktree(name, worktree_path, agent, bypass)
 
 
-def _start_from_url(repo_url: str, agent: str) -> None:
+def _start_from_url(repo_url: str, agent: str, bypass: bool) -> None:
     """Clone the repo if needed, then create a new worktree session."""
     repo_name = git_ops.repo_name_from_url(repo_url)
     workspace = config.workspaces_dir() / repo_name
@@ -143,10 +147,12 @@ def _start_from_url(repo_url: str, agent: str) -> None:
         typer.secho(f"Cloning '{repo_name}'...", fg=typer.colors.CYAN)
         git_ops.clone(repo_url, workspace)
 
-    _new_worktree_session(repo_name, workspace, agent)
+    _new_worktree_session(repo_name, workspace, agent, bypass)
 
 
-def _resume_session(name: str, path: Path, default_agent: str, live: set[str]) -> None:
+def _resume_session(
+    name: str, path: Path, default_agent: str, live: set[str], bypass: bool
+) -> None:
     """Resume a worktree's session, picking an agent if it must be restarted."""
     # A live session is just re-attached; only a dead one needs an agent, so
     # ask which CLI to relaunch it with (vv does not track the prior choice).
@@ -156,7 +162,7 @@ def _resume_session(name: str, path: Path, default_agent: str, live: set[str]) -
         agent = _pick_agent(default_agent)
         if agent is None:
             return
-    _resume_worktree(name, path, agent)
+    _resume_worktree(name, path, agent, bypass)
 
 
 def _delete_session(repo: str, name: str, path: Path, live: set[str]) -> None:
@@ -190,7 +196,7 @@ def _delete_session(repo: str, name: str, path: Path, live: set[str]) -> None:
     typer.secho(f"Deleted worktree '{repo}/{name}'.", fg=typer.colors.GREEN)
 
 
-def _menu_list_sessions(default_agent: str) -> None:
+def _menu_list_sessions(default_agent: str, bypass: bool) -> None:
     """List existing worktrees; resume or delete the chosen one."""
     worktrees = _list_worktrees()
     if not worktrees:
@@ -219,12 +225,12 @@ def _menu_list_sessions(default_agent: str) -> None:
         ],
     ).ask()
     if action == "resume":
-        _resume_session(name, path, default_agent, live)
+        _resume_session(name, path, default_agent, live, bypass)
     elif action == "delete":
         _delete_session(repo, name, path, live)
 
 
-def _menu_new_from_repo(default_agent: str) -> None:
+def _menu_new_from_repo(default_agent: str, bypass: bool) -> None:
     """Pick an already-cloned repo and start a fresh worktree session."""
     repos = _list_repos()
     if not repos:
@@ -239,10 +245,10 @@ def _menu_new_from_repo(default_agent: str) -> None:
     agent = _pick_agent(default_agent)
     if agent is None:
         return
-    _new_worktree_session(choice, config.workspaces_dir() / choice, agent)
+    _new_worktree_session(choice, config.workspaces_dir() / choice, agent, bypass)
 
 
-def _menu_add_repo(default_agent: str) -> None:
+def _menu_add_repo(default_agent: str, bypass: bool) -> None:
     """Prompt for a clone URL and start a session from it."""
     url = questionary.text("Git repository URL:").ask()
     if not url:
@@ -250,7 +256,7 @@ def _menu_add_repo(default_agent: str) -> None:
     agent = _pick_agent(default_agent)
     if agent is None:
         return
-    _start_from_url(url.strip(), agent)
+    _start_from_url(url.strip(), agent, bypass)
 
 
 def _banner() -> None:
@@ -264,7 +270,7 @@ def _banner() -> None:
     typer.echo()
 
 
-def _interactive_menu(default_agent: str) -> None:
+def _interactive_menu(default_agent: str, bypass: bool) -> None:
     """Top-level menu shown when vv is invoked with no arguments."""
     _banner()
     actions = {
@@ -275,7 +281,7 @@ def _interactive_menu(default_agent: str) -> None:
     choice = questionary.select("What would you like to do?", choices=list(actions)).ask()
     if choice is None:
         return
-    actions[choice](default_agent)
+    actions[choice](default_agent, bypass)
 
 
 @app.command()
@@ -294,16 +300,26 @@ def main(
         help="Agent CLI to launch in the session. Falls back to the config "
         "file's `agent`, then 'claude'.",
     ),
+    ask: bool | None = typer.Option(
+        None,
+        "--ask/--no-ask",
+        help="Launch the agent with its normal permission prompts. vv "
+        "bypasses them by default.",
+    ),
 ) -> None:
     """Start (or rejoin) a worktree-backed agent session."""
     try:
         # Precedence: --agent flag / $VV_AGENT > config file > built-in default.
         # Typer fills `agent` from $VV_AGENT, with the explicit flag winning.
         resolved_agent = agent or config.configured_agent() or agents.DEFAULT_AGENT
+        # Bypass permission prompts unless --ask (or the config) opts out;
+        # an explicit --ask/--no-ask flag overrides the config setting.
+        resolved_ask = ask if ask is not None else config.configured_ask()
+        bypass = not resolved_ask
         if repo_url:
-            _start_from_url(repo_url, resolved_agent)
+            _start_from_url(repo_url, resolved_agent, bypass)
         else:
-            _interactive_menu(resolved_agent)
+            _interactive_menu(resolved_agent, bypass)
     except (git_ops.GitError, tmux_ops.TmuxError, config.ConfigError) as exc:
         raise _fail(str(exc)) from exc
     except KeyboardInterrupt:

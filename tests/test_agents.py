@@ -44,3 +44,28 @@ def test_is_installed_checks_the_first_token(monkeypatch):
     assert agents.is_installed("claude") is True
     assert agents.is_installed("claude --resume") is True
     assert agents.is_installed("codex") is False
+
+
+# --- bypass flags -----------------------------------------------------------
+
+def test_claude_has_a_verified_bypass_flag():
+    assert agents.BYPASS_FLAGS["claude"] == "--permission-mode bypassPermissions"
+
+
+def test_with_bypass_appends_the_known_flag():
+    assert agents.with_bypass("claude") == "claude " + agents.BYPASS_FLAGS["claude"]
+
+
+def test_with_bypass_uses_the_base_command_when_args_are_present():
+    result = agents.with_bypass("claude --resume")
+    assert result == "claude --resume " + agents.BYPASS_FLAGS["claude"]
+
+
+def test_with_bypass_leaves_unknown_agents_untouched():
+    assert agents.with_bypass("agy") == "agy"
+    assert agents.with_bypass("madeup-cli") == "madeup-cli"
+
+
+def test_with_bypass_is_idempotent():
+    once = agents.with_bypass("claude")
+    assert agents.with_bypass(once) == once

@@ -69,3 +69,13 @@ def configured_agent() -> str | None:
     if isinstance(value, str) and value.strip():
         return value.strip()
     return None
+
+
+def configured_ask() -> bool:
+    """Return the ``ask`` setting from the config file (default False).
+
+    When True, vv launches agents with their normal permission prompts rather
+    than bypassing them. A non-boolean value is ignored.
+    """
+    value = _load_config().get("ask", False)
+    return value if isinstance(value, bool) else False
