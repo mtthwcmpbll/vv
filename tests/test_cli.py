@@ -223,3 +223,146 @@ def test_resume_worktree_without_bypass_sends_bare_agent(sent_command, tmp_path)
 def test_resume_worktree_bypass_leaves_unknown_agent_unflagged(sent_command, tmp_path):
     cli._resume_worktree("falcon", tmp_path, "agy", bypass=True)
     assert sent_command == ["agy"]
+
+
+# --- chat-only sessions ------------------------------------------------------
+
+@pytest.fixture
+def chat_env(monkeypatch, tmp_path):
+    """Point WORKSPACES_DIR / WORKTREES_DIR at tmp_path and stub tmux entirely."""
+    monkeypatch.setenv("WORKSPACES_DIR", str(tmp_path / "ws"))
+    monkeypatch.setenv("WORKTREES_DIR", str(tmp_path / "wt"))
+    monkeypatch.delenv("VV_AGENT", raising=False)
+    monkeypatch.setenv("VV_CONFIG", str(tmp_path / "missing.toml"))
+
+    # Stub tmux and agent-presence so nothing real runs.
+    monkeypatch.setattr(cli.tmux_ops, "list_sessions", lambda *_a, **_k: [])
+    monkeypatch.setattr(cli.tmux_ops, "session_exists", lambda name: False)
+    monkeypatch.setattr(cli.tmux_ops, "create_session", lambda *a, **k: None)
+    monkeypatch.setattr(cli.tmux_ops, "send_command", lambda *a, **k: None)
+    monkeypatch.setattr(cli.tmux_ops, "attach", lambda *a, **k: None)
+    monkeypatch.setattr(cli.tmux_ops, "kill_session", lambda *a, **k: None)
+    monkeypatch.setattr(cli.agents, "is_installed", lambda _a: True)
+    return tmp_path
+
+
+def test_new_chat_session_creates_dir_under_chats(chat_env):
+    cli._new_chat_session("claude", bypass=False)
+    chats_root = chat_env / "wt" / "_chats"
+    created = [p for p in chats_root.iterdir() if p.is_dir()]
+    assert len(created) == 1
+    # The picked name must be a real word from the curated pool.
+    from vv.names import WORDS
+    assert created[0].name in WORDS
+
+
+def test_list_worktrees_surfaces_chats_under_sentinel(chat_env):
+    cli._new_chat_session("claude", bypass=False)
+    rows = cli._list_worktrees()
+    assert len(rows) == 1
+    repo, name, path = rows[0]
+    assert repo == cli.CHATS
+    assert path == chat_env / "wt" / "_chats" / name
+
+
+def test_chat_name_avoids_existing_session_names(chat_env, monkeypatch):
+    # Pre-create a chat dir named 'falcon', and force random_name to want it.
+    (chat_env / "wt" / "_chats" / "falcon").mkdir(parents=True)
+    calls = {"taken": None}
+
+    def fake_random(taken):
+        calls["taken"] = set(taken)
+        return "otter"
+
+    monkeypatch.setattr(cli.names, "random_name", fake_random)
+    cli._new_chat_session("claude", bypass=False)
+    assert "falcon" in calls["taken"]
+
+
+def test_delete_chat_empty_skips_warning_and_removes_dir(chat_env, monkeypatch):
+    chat_path = chat_env / "wt" / "_chats" / "falcon"
+    chat_path.mkdir(parents=True)
+
+    confirms: list = []
+    monkeypatch.setattr(
+        cli.questionary, "confirm",
+        lambda *a, **k: confirms.append(a) or _Answer(False),
+    )
+
+    cli._delete_session(cli.CHATS, "falcon", chat_path, live=set())
+    assert confirms == []          # empty dir -> no warning
+    assert not chat_path.exists()  # actually removed
+
+
+def test_delete_chat_nonempty_prompts_and_can_be_cancelled(chat_env, monkeypatch):
+    chat_path = chat_env / "wt" / "_chats" / "falcon"
+    chat_path.mkdir(parents=True)
+    (chat_path / "notes.md").write_text("important\n")
+
+    confirms: list = []
+    monkeypatch.setattr(
+        cli.questionary, "confirm",
+        lambda *a, **k: confirms.append(a) or _Answer(False),
+    )
+
+    cli._delete_session(cli.CHATS, "falcon", chat_path, live=set())
+    assert len(confirms) == 1      # warned about contents
+    assert chat_path.exists()      # cancelled -> kept
+
+
+def test_delete_chat_does_not_invoke_git_ops(chat_env, monkeypatch):
+    chat_path = chat_env / "wt" / "_chats" / "falcon"
+    chat_path.mkdir(parents=True)
+
+    def boom(*a, **k):  # noqa: ARG001
+        raise AssertionError("git_ops must not be called for chat sessions")
+
+    monkeypatch.setattr(cli.git_ops, "is_dirty", boom)
+    monkeypatch.setattr(cli.git_ops, "unpushed_count", boom)
+    monkeypatch.setattr(cli.git_ops, "remove_worktree", boom)
+    monkeypatch.setattr(cli.git_ops, "delete_branch", boom)
+
+    cli._delete_session(cli.CHATS, "falcon", chat_path, live=set())
+    assert not chat_path.exists()
+
+
+def test_delete_chat_kills_live_tmux_session(chat_env, monkeypatch):
+    chat_path = chat_env / "wt" / "_chats" / "falcon"
+    chat_path.mkdir(parents=True)
+    killed: list = []
+    monkeypatch.setattr(cli.tmux_ops, "kill_session", killed.append)
+
+    cli._delete_session(cli.CHATS, "falcon", chat_path, live={"falcon"})
+    assert killed == ["falcon"]
+
+
+def test_chat_flag_starts_new_chat_session(monkeypatch, tmp_path):
+    """`vv --chat` routes to _new_chat_session with the resolved agent."""
+    seen: dict = {}
+    monkeypatch.setattr(
+        cli, "_new_chat_session",
+        lambda agent, bypass: seen.update(agent=agent, bypass=bypass),
+    )
+    monkeypatch.delenv("VV_AGENT", raising=False)
+    monkeypatch.setenv("VV_CONFIG", str(tmp_path / "missing.toml"))
+
+    result = runner.invoke(cli.app, ["--chat", "--agent", "codex"])
+    assert result.exit_code == 0, result.output
+    assert seen == {"agent": "codex", "bypass": True}
+
+
+def test_chat_flag_rejects_repo_url(monkeypatch, tmp_path):
+    """`vv --chat <url>` must error out — the combination is contradictory."""
+    monkeypatch.delenv("VV_AGENT", raising=False)
+    monkeypatch.setenv("VV_CONFIG", str(tmp_path / "missing.toml"))
+    # Sanity: neither downstream entry point should be reached.
+    monkeypatch.setattr(
+        cli, "_new_chat_session", lambda agent, bypass: pytest.fail("called")
+    )
+    monkeypatch.setattr(
+        cli, "_start_from_url", lambda url, agent, bypass: pytest.fail("called")
+    )
+
+    result = runner.invoke(cli.app, ["--chat", _REPO_URL])
+    assert result.exit_code == 1
+    assert "cannot be combined" in result.output

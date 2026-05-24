@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 import questionary
@@ -13,6 +14,10 @@ app = typer.Typer(
     add_completion=False,
     help="Spin up disposable git worktree + tmux + agent CLI sessions.",
 )
+
+# Sentinel "repo" identifier for chat-only sessions: they live under
+# WORKTREES_DIR/_chats/<name> instead of belonging to a real cloned repo.
+CHATS = "_chats"
 
 
 def _fail(message: str) -> "typer.Exit":
@@ -28,7 +33,11 @@ def _list_repos() -> list[str]:
 
 
 def _list_worktrees() -> list[tuple[str, str, Path]]:
-    """Return ``(repo, name, path)`` for every vv worktree across all repos."""
+    """Return ``(repo, name, path)`` for every vv session across all repos.
+
+    Chat-only sessions (no git worktree) are surfaced under the sentinel
+    :data:`CHATS` namespace so the same menu can resume / delete them.
+    """
     worktrees_root = config.worktrees_dir()
     found: list[tuple[str, str, Path]] = []
     for repo in _list_repos():
@@ -44,6 +53,9 @@ def _list_worktrees() -> list[tuple[str, str, Path]]:
             # Keep only the disposable worktrees vv created, not the main clone.
             if path.parent == repo_worktrees:
                 found.append((repo, path.name, path))
+    for path in sorted(config.chats_dir().iterdir()):
+        if path.is_dir():
+            found.append((CHATS, path.name, path))
     return sorted(found)
 
 
@@ -132,6 +144,27 @@ def _new_worktree_session(
     _resume_worktree(name, worktree_path, agent, bypass)
 
 
+def _new_chat_session(agent: str, bypass: bool) -> None:
+    """Create an empty chat-only session dir and attach an agent to it.
+
+    Chat sessions are not backed by a git worktree — they are just a plain
+    directory under :func:`config.chats_dir`, intended for persistent agent
+    conversations that don't need (or want) version control.
+    """
+    chats_root = config.chats_dir()
+
+    # Avoid colliding with any existing tmux session or vv session name.
+    taken: set[str] = set(tmux_ops.list_sessions())
+    taken |= {name for _repo, name, _path in _list_worktrees()}
+
+    name = names.random_name(taken)
+    chat_path = chats_root / name
+    chat_path.mkdir(parents=True)
+
+    typer.secho(f"Creating chat session '{name}'...", fg=typer.colors.CYAN)
+    _resume_worktree(name, chat_path, agent, bypass)
+
+
 def _start_from_url(repo_url: str, agent: str, bypass: bool) -> None:
     """Clone the repo if needed, then create a new worktree session."""
     repo_name = git_ops.repo_name_from_url(repo_url)
@@ -165,8 +198,31 @@ def _resume_session(
     _resume_worktree(name, path, agent, bypass)
 
 
+def _delete_chat(name: str, path: Path, live: set[str]) -> None:
+    """Delete a chat session dir, warning first if it has any contents."""
+    if any(path.iterdir()):
+        typer.secho(
+            f"chat '{name}' has files in it that would be lost.",
+            fg=typer.colors.YELLOW,
+        )
+        confirmed = questionary.confirm(
+            "Delete it and everything in it? This cannot be undone.", default=False
+        ).ask()
+        if not confirmed:
+            typer.secho("Cancelled — chat kept.", fg=typer.colors.CYAN)
+            return
+
+    if name in live:
+        tmux_ops.kill_session(name)
+    shutil.rmtree(path)
+    typer.secho(f"Deleted chat '{name}'.", fg=typer.colors.GREEN)
+
+
 def _delete_session(repo: str, name: str, path: Path, live: set[str]) -> None:
-    """Delete a worktree, warning first if it holds work that would be lost."""
+    """Delete a session, warning first if it holds work that would be lost."""
+    if repo == CHATS:
+        return _delete_chat(name, path, live)
+
     workspace = config.workspaces_dir() / repo
 
     risks: list[str] = []
@@ -259,6 +315,14 @@ def _menu_add_repo(default_agent: str, bypass: bool) -> None:
     _start_from_url(url.strip(), agent, bypass)
 
 
+def _menu_new_chat(default_agent: str, bypass: bool) -> None:
+    """Start a fresh chat-only session (no git repo)."""
+    agent = _pick_agent(default_agent)
+    if agent is None:
+        return
+    _new_chat_session(agent, bypass)
+
+
 def _banner() -> None:
     """Print vv's branch-diagram banner above the interactive menu."""
     dim = typer.colors.BRIGHT_BLACK
@@ -277,6 +341,7 @@ def _interactive_menu(default_agent: str, bypass: bool) -> None:
         "⊞  List existing sessions": _menu_list_sessions,
         "✦  Start a new session from an existing repo": _menu_new_from_repo,
         "⊕  Add a new repo": _menu_add_repo,
+        "✎  Start a chat-only session (no repo)": _menu_new_chat,
     }
     choice = questionary.select("What would you like to do?", choices=list(actions)).ask()
     if choice is None:
@@ -306,6 +371,13 @@ def main(
         help="Launch the agent with its normal permission prompts. vv "
         "bypasses them by default.",
     ),
+    chat: bool = typer.Option(
+        False,
+        "--chat",
+        "-c",
+        help="Start a chat-only session (no git repo). Cannot be combined "
+        "with a repo URL.",
+    ),
 ) -> None:
     """Start (or rejoin) a worktree-backed agent session."""
     try:
@@ -316,7 +388,11 @@ def main(
         # an explicit --ask/--no-ask flag overrides the config setting.
         resolved_ask = ask if ask is not None else config.configured_ask()
         bypass = not resolved_ask
-        if repo_url:
+        if chat:
+            if repo_url:
+                raise _fail("--chat cannot be combined with a repo URL")
+            _new_chat_session(resolved_agent, bypass)
+        elif repo_url:
             _start_from_url(repo_url, resolved_agent, bypass)
         else:
             _interactive_menu(resolved_agent, bypass)

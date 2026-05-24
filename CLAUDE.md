@@ -41,14 +41,18 @@ The **worktree is the session**: a worktree exists whether or not a tmux
 session is currently live for it. Resuming a worktree attaches to its tmux
 session if one is running, or starts a fresh one otherwise.
 
-Three flows, all ending in `_resume_worktree()`:
+Four flows, all ending in `_resume_worktree()`:
 
 - **`vv <repo_url>`** → `cli._start_from_url()`: clone into
   `WORKSPACES_DIR/<repo>` (or fetch if already present), then
   `_new_worktree_session()`.
+- **`vv --chat`** (a.k.a. `-c`) → `cli._new_chat_session()`: create an empty
+  directory under `WORKTREES_DIR/_chats/<name>` (no git involved), then
+  `_resume_worktree()`. For persistent agent conversations that don't need
+  version control. Cannot be combined with a repo URL.
 - **`vv`** (no args) → `cli._interactive_menu()`: a `questionary` menu to
-  list existing sessions, start a worktree from an already-cloned repo, or
-  add a repo by URL.
+  list existing sessions, start a worktree from an already-cloned repo, add a
+  repo by URL, or start a chat-only session.
 
 `_new_worktree_session()` picks a random collision-free word
 (`names.random_name()`, excluding existing tmux sessions, git branches, and
@@ -60,7 +64,9 @@ attaches to the live tmux session of that name if one exists, otherwise starts
 a detached session rooted at the worktree, sends the agent command to it, and
 attaches. `_list_worktrees()` enumerates worktrees across all cloned repos (via
 `git_ops.list_worktrees()`, filtered to the per-repo `WORKTREES_DIR` location)
-to feed the "list existing sessions" menu.
+**plus chat-only sessions** under the `_chats` sentinel namespace, to feed the
+"list existing sessions" menu. Chat sessions surface in that listing as
+`(_chats, name, path)` tuples; the sentinel string is `cli.CHATS = "_chats"`.
 
 The "list existing sessions" menu (`_menu_list_sessions()`) offers each chosen
 worktree a **resume** (→ `_resume_session()`) or **delete** (→
@@ -69,7 +75,8 @@ worktree a **resume** (→ `_resume_session()`) or **delete** (→
 a `questionary.confirm()` before proceeding. It then kills any live tmux
 session and runs `git_ops.remove_worktree(force=True)` +
 `git_ops.delete_branch(force=True)` — so a deleted worktree frees its name for
-reuse.
+reuse. Chat sessions branch through `_delete_chat()` instead: no git ops, but
+the user is still warned if the directory is non-empty before `shutil.rmtree`.
 
 The **agent** is just the command typed into a fresh session, so anything on
 `PATH` works. It is resolved once in `cli.main()` with precedence
@@ -89,9 +96,10 @@ is verified; the others in `BYPASS_FLAGS` are best-guesses.
 ### Module responsibilities
 
 - `config.py` — resolves `WORKSPACES_DIR` / `WORKTREES_DIR` and the `VV_CONFIG`
-  TOML file (all env-overridable; default under `~/.vv/`). Parses the config
-  file (`configured_agent()`, `configured_ask()`); raises `ConfigError` on
-  malformed TOML.
+  TOML file (all env-overridable; default under `~/.vv/`). Also exposes
+  `chats_dir()` (= `WORKTREES_DIR/_chats`) for chat-only sessions. Parses the
+  config file (`configured_agent()`, `configured_ask()`); raises `ConfigError`
+  on malformed TOML.
 - `agents.py` — `DEFAULT_AGENT`, the `KNOWN_AGENTS` list seeding the picker,
   `PATH` detection (`installed_agents()`, `is_installed()`), and the
   `BYPASS_FLAGS` map + `with_bypass()`.

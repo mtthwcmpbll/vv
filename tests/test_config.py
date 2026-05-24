@@ -34,6 +34,13 @@ def test_worktrees_dir_honors_env_and_creates_it(monkeypatch, tmp_path):
     assert result.is_dir()
 
 
+def test_chats_dir_lives_under_worktrees_dir(monkeypatch, tmp_path):
+    monkeypatch.setenv("WORKTREES_DIR", str(tmp_path / "wt"))
+    result = config.chats_dir()
+    assert result == tmp_path / "wt" / "_chats"
+    assert result.is_dir()
+
+
 # --- config file location ---------------------------------------------------
 
 def test_config_file_honors_env(monkeypatch, tmp_path):
