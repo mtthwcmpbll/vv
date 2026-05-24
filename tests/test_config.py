@@ -99,3 +99,25 @@ def test_malformed_config_raises_config_error(monkeypatch, tmp_path):
     _use_config(monkeypatch, tmp_path, 'agent = "unterminated\n')
     with pytest.raises(config.ConfigError):
         config.configured_agent()
+
+
+# --- configured_ask ---------------------------------------------------------
+
+def test_configured_ask_is_false_without_a_file(monkeypatch, tmp_path):
+    monkeypatch.setenv("VV_CONFIG", str(tmp_path / "missing.toml"))
+    assert config.configured_ask() is False
+
+
+def test_configured_ask_reads_true(monkeypatch, tmp_path):
+    _use_config(monkeypatch, tmp_path, "ask = true\n")
+    assert config.configured_ask() is True
+
+
+def test_configured_ask_reads_false(monkeypatch, tmp_path):
+    _use_config(monkeypatch, tmp_path, "ask = false\n")
+    assert config.configured_ask() is False
+
+
+def test_configured_ask_ignores_non_boolean_values(monkeypatch, tmp_path):
+    _use_config(monkeypatch, tmp_path, 'ask = "yes"\n')
+    assert config.configured_ask() is False

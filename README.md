@@ -48,6 +48,21 @@ Precedence is `--agent` flag → `$VV_AGENT` → config file → `claude`. The
 interactive menu prompts you to choose, listing the known agents found on
 your `PATH`.
 
+### Permission prompts
+
+Each session runs in a disposable worktree, so `vv` launches agents in
+**bypass mode** — their permission/approval prompts are turned off. Use
+`--ask` to launch with the agent's normal prompts instead, or set
+`ask = true` in the config file (`--ask` / `--no-ask` override it per run).
+
+```sh
+vv --ask https://github.com/owner/repo.git   # keep the agent's prompts
+```
+
+> Only Claude Code's bypass flag is verified. The flags for the other agents
+> live in `BYPASS_FLAGS` in `vv/agents.py` and are best-guesses — check each
+> CLI's `--help` and correct them.
+
 ## Install
 
 Requires `git` and `tmux` on your `PATH`, plus at least one agent CLI.
@@ -73,5 +88,5 @@ vv                                     # interactive menu
 | ---------------- | ---------------------- | -------------------------------------- |
 | `WORKSPACES_DIR` | `~/.vv/workspaces`     | Primary clone of each repo             |
 | `WORKTREES_DIR`  | `~/.vv/worktrees`      | Per-session worktrees, grouped by repo |
-| `VV_CONFIG`      | `~/.vv/config.toml`    | TOML config file (`agent` key)         |
+| `VV_CONFIG`      | `~/.vv/config.toml`    | TOML config file (`agent`, `ask` keys) |
 | `VV_AGENT`       | `claude`               | Agent CLI to launch (`--agent` wins)   |

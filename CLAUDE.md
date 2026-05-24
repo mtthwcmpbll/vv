@@ -86,14 +86,23 @@ interactive menu's new-session flows call `_pick_agent()` (a `questionary`
 picker of `agents.installed_agents()`); resuming a *dead* worktree also picks,
 a *live* one just re-attaches. The `vv <repo_url>` flow never prompts.
 
+Agents launch in **bypass mode** (permission prompts off) by default —
+`_resume_worktree()` appends a per-agent flag via `agents.with_bypass()`,
+looked up in `agents.BYPASS_FLAGS`. `cli.main()` resolves a `bypass` bool
+(off when `--ask`/`--no-ask` or the config's `ask` key opts out, flag winning)
+and threads it through the flow alongside `agent`. Only Claude's bypass flag
+is verified; the others in `BYPASS_FLAGS` are best-guesses.
+
 ### Module responsibilities
 
 - `config.py` — resolves `WORKSPACES_DIR` / `WORKTREES_DIR` and the `VV_CONFIG`
   TOML file (all env-overridable; default under `~/.vv/`). Also exposes
   `chats_dir()` (= `WORKTREES_DIR/_chats`) for chat-only sessions. Parses the
-  config file (`configured_agent()`); raises `ConfigError` on malformed TOML.
+  config file (`configured_agent()`, `configured_ask()`); raises `ConfigError`
+  on malformed TOML.
 - `agents.py` — `DEFAULT_AGENT`, the `KNOWN_AGENTS` list seeding the picker,
-  and `PATH` detection (`installed_agents()`, `is_installed()`).
+  `PATH` detection (`installed_agents()`, `is_installed()`), and the
+  `BYPASS_FLAGS` map + `with_bypass()`.
 - `git_ops.py` — `git` CLI wrappers; raises `GitError`.
 - `tmux_ops.py` — `tmux` CLI wrappers; raises `TmuxError`.
 - `names.py` — curated single-word name list + collision-avoiding picker.

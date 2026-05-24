@@ -23,6 +23,20 @@ KNOWN_AGENTS: tuple[str, ...] = (
     "agy",      # agy-cli
 )
 
+#: Flags that disable an agent's interactive permission/approval prompts,
+#: keyed by command name. vv appends these when launching in bypass mode.
+#:
+#: ONLY ``claude``'s flag is verified. The codex/gemini/copilot entries are
+#: best-guesses — check each CLI's own ``--help`` and correct them; a wrong
+#: flag makes that agent fail to start. Agents absent from this map (e.g.
+#: ``agy``) simply launch without a bypass flag.
+BYPASS_FLAGS: dict[str, str] = {
+    "claude": "--permission-mode bypassPermissions",
+    "codex": "--dangerously-bypass-approvals-and-sandbox",  # VERIFY
+    "gemini": "--yolo",                                     # VERIFY
+    "copilot": "--allow-all-tools",                         # VERIFY
+}
+
 
 def _command_of(agent: str) -> str:
     """Return the executable name from an agent string (which may have args)."""
@@ -41,3 +55,15 @@ def is_installed(agent: str) -> bool:
     Only the first token is checked, so ``"claude --foo"`` tests ``claude``.
     """
     return shutil.which(_command_of(agent)) is not None
+
+
+def with_bypass(agent: str) -> str:
+    """Return ``agent`` with its 'skip permission prompts' flag appended.
+
+    Returns ``agent`` unchanged when vv knows no flag for the command, or when
+    the flag is already present (so it is safe to call more than once).
+    """
+    flag = BYPASS_FLAGS.get(_command_of(agent))
+    if not flag or flag in agent:
+        return agent
+    return f"{agent} {flag}"
