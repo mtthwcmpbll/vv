@@ -39,6 +39,17 @@ def worktrees_dir() -> Path:
     return path
 
 
+def chats_dir() -> Path:
+    """Directory holding chat-only sessions (no repo, no git worktree).
+
+    Lives under :func:`worktrees_dir` as a sentinel ``_chats`` namespace; the
+    leading underscore guarantees it cannot collide with a real repo name.
+    """
+    path = worktrees_dir() / "_chats"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def config_file() -> Path:
     """Path to the vv TOML config file (override with ``VV_CONFIG``)."""
     raw = os.environ.get("VV_CONFIG")
