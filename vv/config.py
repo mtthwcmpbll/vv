@@ -118,6 +118,17 @@ def configured_ask() -> bool:
     return value if isinstance(value, bool) else False
 
 
+def configured_clone_protocol() -> str:
+    """Return the protocol for GitHub clone URLs: ``"ssh"`` (default) or ``"https"``.
+
+    Set ``clone_protocol`` in the config file to override. Only an explicit
+    ``"https"`` switches away from SSH; any other value — missing, a typo, a
+    non-string — falls back to the ``"ssh"`` default, matching how
+    :func:`gh_ops.clone_url` builds ``git@github.com:owner/name.git`` URLs.
+    """
+    return "https" if _load_config().get("clone_protocol") == "https" else "ssh"
+
+
 def configured_mode() -> str:
     """Return the launcher mode: ``"remote"`` or (default) ``"local"``.
 

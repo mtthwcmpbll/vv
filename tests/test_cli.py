@@ -389,6 +389,93 @@ def test_explicit_name_collision_is_rejected(chat_env):
         cli._new_chat_session("claude", bypass=False, name="falcon")
 
 
+# --- _menu_add_repo GitHub repo picker --------------------------------------
+
+@pytest.fixture
+def add_repo_harness(monkeypatch):
+    """Stub _start_from_url / _pick_agent / the picker around _menu_add_repo.
+
+    ``configure(repos=..., picked=..., typed=..., available=...)`` wires gh_ops,
+    the repo picker (returns ``picked``) and the URL text prompt (returns
+    ``typed``); returns a dict capturing the URL handed to _start_from_url.
+    """
+    seen: dict = {}
+    monkeypatch.setattr(
+        cli, "_start_from_url",
+        lambda url, agent, bypass, name=None: seen.update(url=url, agent=agent),
+    )
+    monkeypatch.setattr(cli, "_pick_agent", lambda default: "claude")
+
+    def configure(*, repos, picked=None, typed=None, available=True, protocol="ssh"):
+        monkeypatch.setattr(cli.gh_ops, "is_available", lambda: available)
+        monkeypatch.setattr(cli.gh_ops, "list_repos", lambda: repos)
+        monkeypatch.setattr(cli.config, "configured_clone_protocol", lambda: protocol)
+        monkeypatch.setattr(
+            cli.gh_ops, "clone_url",
+            lambda nwo, proto="ssh": f"{proto}://github.com/{nwo}.git",
+        )
+        monkeypatch.setattr(cli, "_pick_repo", lambda _repos: picked)
+        monkeypatch.setattr(cli.questionary, "text", lambda *a, **k: _Answer(typed))
+        return seen
+
+    return configure
+
+
+def test_add_repo_picked_repo_uses_configured_protocol(add_repo_harness):
+    seen = add_repo_harness(repos=["octo/repo"], picked="octo/repo", protocol="ssh")
+    cli._menu_add_repo("claude", bypass=True)
+    assert seen["url"] == "ssh://github.com/octo/repo.git"  # default protocol
+
+
+def test_add_repo_picked_repo_honors_https_protocol(add_repo_harness):
+    seen = add_repo_harness(repos=["octo/repo"], picked="octo/repo", protocol="https")
+    cli._menu_add_repo("claude", bypass=True)
+    assert seen["url"] == "https://github.com/octo/repo.git"
+
+
+def test_add_repo_enter_url_sentinel_prompts_for_url(add_repo_harness):
+    url = "git@example.com:team/thing.git"
+    seen = add_repo_harness(repos=["octo/repo"], picked=cli._ENTER_URL, typed=url)
+    cli._menu_add_repo("claude", bypass=True)
+    assert seen["url"] == url  # sentinel -> free-text URL, passed through verbatim
+
+
+def test_add_repo_falls_back_to_text_when_gh_unavailable(add_repo_harness):
+    url = "https://example.com/owner/repo.git"
+    seen = add_repo_harness(repos=[], typed=url, available=False)
+    cli._menu_add_repo("claude", bypass=True)
+    assert seen["url"] == url
+
+
+def test_add_repo_cancelled_picker_aborts(add_repo_harness):
+    seen = add_repo_harness(repos=["octo/repo"], picked=None)
+    cli._menu_add_repo("claude", bypass=True)
+    assert seen == {}  # cancelled -> no session started
+
+
+def test_add_repo_blank_url_aborts(add_repo_harness):
+    seen = add_repo_harness(repos=["octo/repo"], picked=cli._ENTER_URL, typed="")
+    cli._menu_add_repo("claude", bypass=True)
+    assert seen == {}  # empty URL -> no session started
+
+
+def test_cap_select_rows_limits_choice_window_height():
+    """_cap_select_rows caps the choices window so long lists scroll, not flood."""
+    question = cli.questionary.select(
+        "m",
+        choices=[f"r{i}" for i in range(20)],
+        use_search_filter=True,
+        use_jk_keys=False,
+    )
+    cli._cap_select_rows(question, 5)
+    capped = [
+        c.height.max
+        for c in question.application.layout.walk()
+        if type(getattr(c, "content", None)).__name__ == "InquirerControl"
+    ]
+    assert capped == [5]
+
+
 # --- remote-launcher mode ----------------------------------------------------
 
 @pytest.fixture

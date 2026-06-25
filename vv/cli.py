@@ -8,7 +8,7 @@ from pathlib import Path
 import questionary
 import typer
 
-from . import agents, cmux_ops, config, git_ops, names, remote, tmux_ops
+from . import agents, cmux_ops, config, gh_ops, git_ops, names, remote, tmux_ops
 
 app = typer.Typer(
     add_completion=False,
@@ -358,15 +358,85 @@ def _menu_new_from_repo(default_agent: str, bypass: bool) -> None:
     _new_worktree_session(choice, config.workspaces_dir() / choice, agent, bypass)
 
 
+# Sentinel choice in the repo picker: drop to a free-text clone-URL prompt
+# instead of picking one of the listed GitHub repos.
+_ENTER_URL = object()
+
+
+def _cap_select_rows(question: "questionary.Question", rows: int) -> None:
+    """Limit a ``questionary.select`` to ``rows`` visible choice rows.
+
+    questionary renders the whole choice list inline, so a long list (hundreds
+    of repos) would flood the terminal. We cap the height of the window holding
+    the choices; prompt_toolkit then scrolls that window to follow the cursor.
+    Purely cosmetic — any failure (a questionary/prompt_toolkit internals change)
+    is swallowed, leaving the default full-height list.
+    """
+    from prompt_toolkit.layout.dimension import Dimension
+
+    try:
+        for container in question.application.layout.walk():
+            content = getattr(container, "content", None)
+            if type(content).__name__ == "InquirerControl":
+                container.height = Dimension(min=1, max=rows)
+                return
+    except Exception:  # noqa: BLE001 — cosmetic only, never block the prompt
+        pass
+
+
+def _pick_repo(repos: list[str]) -> object | None:
+    """Show a scrollable, filter-as-you-type list of GitHub repos.
+
+    Returns the chosen ``owner/name`` string, the :data:`_ENTER_URL` sentinel
+    when the user opts to type a clone URL instead, or ``None`` if cancelled.
+    Typing filters the list by substring (questionary's ``use_search_filter``);
+    at most 5 rows show at once, scrollable with the arrow keys.
+    """
+    choices = [
+        questionary.Choice(title="↗  Enter a clone URL instead…", value=_ENTER_URL),
+        *repos,
+    ]
+    question = questionary.select(
+        "Pick a GitHub repo (type to filter), or enter a URL:",
+        choices=choices,
+        use_search_filter=True,  # typing filters the list (substring match)
+        use_jk_keys=False,       # required with search filter: j/k become input
+        show_selected=False,
+    )
+    _cap_select_rows(question, 5)
+    return question.ask()
+
+
 def _menu_add_repo(default_agent: str, bypass: bool) -> None:
-    """Prompt for a clone URL and start a session from it."""
-    url = questionary.text("Git repository URL:").ask()
+    """Pick a GitHub repo (or enter a clone URL) and start a session from it.
+
+    When ``gh`` is available and logged in, show a scrollable list of every repo
+    the user can access (``owner/name``), filterable as you type. Picking one
+    resolves to its clone URL; the "enter a clone URL" entry (and the whole flow
+    when gh is unavailable) falls back to the original paste-a-URL behavior.
+    """
+    repos: list[str] = []
+    if gh_ops.is_available():
+        typer.secho("Fetching your GitHub repositories...", fg=typer.colors.CYAN)
+        repos = gh_ops.list_repos()
+
+    if repos:
+        picked = _pick_repo(repos)
+        if picked is None:
+            return
+        if picked is _ENTER_URL:
+            url = (questionary.text("Git repository URL:").ask() or "").strip()
+        else:
+            url = gh_ops.clone_url(picked, config.configured_clone_protocol())  # type: ignore[arg-type]
+    else:
+        url = (questionary.text("Git repository URL:").ask() or "").strip()
+
     if not url:
         return
     agent = _pick_agent(default_agent)
     if agent is None:
         return
-    _start_from_url(url.strip(), agent, bypass)
+    _start_from_url(url, agent, bypass)
 
 
 def _menu_new_chat(default_agent: str, bypass: bool) -> None:

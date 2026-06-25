@@ -52,7 +52,20 @@ Four flows, all ending in `_resume_worktree()`:
   version control. Cannot be combined with a repo URL.
 - **`vv`** (no args) → `cli._interactive_menu()`: a `questionary` menu to
   list existing sessions, start a worktree from an already-cloned repo, add a
-  repo by URL, or start a chat-only session.
+  repo (pick from your GitHub repos via `gh`, or paste a URL), or start a
+  chat-only session.
+
+`_menu_add_repo()` shows a scrollable `questionary.select` of every GitHub repo
+the user can access (`_pick_repo()`) when `gh_ops.is_available()` (gh on PATH
+and logged in). Typing filters the `owner/name` list by **substring**
+(`use_search_filter=True`, which forces `use_jk_keys=False`); `_cap_select_rows()`
+limits it to 5 visible rows (it reaches into the prompt_toolkit layout and caps
+the choices `Window` height — purely cosmetic, wrapped in a swallow-all `try`).
+A first sentinel choice (`_ENTER_URL`) drops to a free-text clone-URL prompt; a
+real pick resolves via `gh_ops.clone_url()` using the config's
+`clone_protocol` (`config.configured_clone_protocol()`, default `ssh`,
+override with `clone_protocol = "https"`). When gh is unavailable the flow is
+the original plain URL `questionary.text`. All paths feed `_start_from_url`.
 
 `_new_worktree_session()` picks a random collision-free word
 (`names.random_name()`, excluding existing tmux sessions, git branches, and
@@ -149,12 +162,22 @@ is verified; the others in `BYPASS_FLAGS` are best-guesses.
   TOML file (all env-overridable; default under `~/.vv/`). Also exposes
   `chats_dir()` (= `WORKTREES_DIR/_chats`) for chat-only sessions. Parses the
   config file (`configured_agent()`, `configured_ask()`, `configured_mode()`,
-  `configured_remote()` → the `Remote` dataclass); raises `ConfigError` on
-  malformed TOML or a half-configured `[remote]`.
+  `configured_clone_protocol()` → `ssh`/`https`, `configured_remote()` → the
+  `Remote` dataclass); raises `ConfigError` on malformed TOML or a
+  half-configured `[remote]`.
 - `agents.py` — `DEFAULT_AGENT`, the `KNOWN_AGENTS` list seeding the picker,
   `PATH` detection (`installed_agents()`, `is_installed()`), and the
   `BYPASS_FLAGS` map + `with_bypass()`.
 - `git_ops.py` — `git` CLI wrappers; raises `GitError`.
+- `gh_ops.py` — optional `gh` (GitHub CLI) wrappers powering the "Add a new
+  repo" picker: `is_available()` (on PATH **and** authenticated),
+  `list_repos()` (every `owner/name` the user can access via the `user/repos`
+  API, paginated and `gh`-cached for an hour — spans org repos, not just the
+  user's own), and `clone_url()` (maps a picked `owner/name` to a github.com
+  URL in the caller-supplied protocol — SSH `git@github.com:…` by default, else
+  HTTPS; resolved from `config.configured_clone_protocol()`). Unlike the other
+  ops modules it **never raises** — every failure degrades to `[]` so the menu
+  falls back to manual URL entry.
 - `tmux_ops.py` — `tmux` CLI wrappers; raises `TmuxError`.
 - `cmux_ops.py` — `cmux` CLI wrappers for remote mode (`is_available()`,
   `new_ssh_workspace()` → opens a `cmux ssh` workspace and returns its id,

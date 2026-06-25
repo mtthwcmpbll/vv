@@ -140,6 +140,23 @@ def test_configured_mode_unknown_value_falls_back_to_local(monkeypatch, tmp_path
     assert config.configured_mode() == "local"
 
 
+# --- configured_clone_protocol ----------------------------------------------
+
+def test_configured_clone_protocol_defaults_to_ssh_without_a_file(monkeypatch, tmp_path):
+    monkeypatch.setenv("VV_CONFIG", str(tmp_path / "missing.toml"))
+    assert config.configured_clone_protocol() == "ssh"
+
+
+def test_configured_clone_protocol_reads_https(monkeypatch, tmp_path):
+    _use_config(monkeypatch, tmp_path, 'clone_protocol = "https"\n')
+    assert config.configured_clone_protocol() == "https"
+
+
+def test_configured_clone_protocol_unknown_value_falls_back_to_ssh(monkeypatch, tmp_path):
+    _use_config(monkeypatch, tmp_path, 'clone_protocol = "potato"\n')
+    assert config.configured_clone_protocol() == "ssh"
+
+
 # --- configured_remote ------------------------------------------------------
 
 def test_configured_remote_is_none_without_a_table(monkeypatch, tmp_path):
