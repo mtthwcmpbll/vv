@@ -78,6 +78,32 @@ session and runs `git_ops.remove_worktree(force=True)` +
 reuse. Chat sessions branch through `_delete_chat()` instead: no git ops, but
 the user is still warned if the directory is non-empty before `shutil.rmtree`.
 
+### Remote-launcher mode (cmux)
+
+By default vv runs everything locally. When `mode = "remote"` in the config
+file (overridable per-call with `--remote`/`--local`, env `VV_REMOTE`), vv
+becomes a thin **launcher**: it does no git/tmux work itself, but opens a
+[cmux](https://cmux.com) workspace (a vertical tab) whose command SSHes into the
+configured server and runs `vv` *there*. The real worktree/tmux/agent session is
+created on the remote, surfaced locally as a cmux tab.
+
+It is **transparent** — `cli._launch_remote()` forwards the invocation's intent
+to the remote vv: bare `vv` runs the remote's own interactive TUI over SSH,
+`vv <url>` / `vv --chat` run the remote create flow. `--local` is always
+forwarded so the remote (which has no `[remote]` config of its own) never
+recurses. `ssh -t` forces a TTY so the remote attach/TUI work inside the pane.
+
+**Name mirroring is conditional:** when a session is created up front (a URL or
+`--chat`, and no explicit `--name`), local vv pre-generates the name via
+`remote.gen_name()`, passes it as `--name N`, and titles the cmux tab `N` so the
+tab maps 1:1 to the remote session. Bare `vv` → remote TUI has no name in
+advance, so the tab is titled after the host and the remote names its own
+sessions. The `--name` flag is consumed by the *remote* vv's local create flows
+(`_new_worktree_session` / `_new_chat_session`), which reject an already-taken
+name. Config lives in a single `[remote]` table (`host` required; optional
+`user`, `port`, `ssh_options`, `vv_command`, `cwd`) parsed by
+`config.configured_remote()`.
+
 The **agent** is just the command typed into a fresh session, so anything on
 `PATH` works. It is resolved once in `cli.main()` with precedence
 `--agent` flag / `$VV_AGENT` (both via Typer's `envvar=`) > config file's
@@ -98,21 +124,30 @@ is verified; the others in `BYPASS_FLAGS` are best-guesses.
 - `config.py` — resolves `WORKSPACES_DIR` / `WORKTREES_DIR` and the `VV_CONFIG`
   TOML file (all env-overridable; default under `~/.vv/`). Also exposes
   `chats_dir()` (= `WORKTREES_DIR/_chats`) for chat-only sessions. Parses the
-  config file (`configured_agent()`, `configured_ask()`); raises `ConfigError`
-  on malformed TOML.
+  config file (`configured_agent()`, `configured_ask()`, `configured_mode()`,
+  `configured_remote()` → the `Remote` dataclass); raises `ConfigError` on
+  malformed TOML or a half-configured `[remote]`.
 - `agents.py` — `DEFAULT_AGENT`, the `KNOWN_AGENTS` list seeding the picker,
   `PATH` detection (`installed_agents()`, `is_installed()`), and the
   `BYPASS_FLAGS` map + `with_bypass()`.
 - `git_ops.py` — `git` CLI wrappers; raises `GitError`.
 - `tmux_ops.py` — `tmux` CLI wrappers; raises `TmuxError`.
+- `cmux_ops.py` — `cmux` CLI wrappers for remote mode (`is_available()`,
+  `new_workspace()`, `list_workspace_titles()`); raises `CmuxError`.
+- `remote.py` — remote-launcher orchestration: builds the `ssh … '<vv …>'`
+  command and hands it to `cmux_ops.new_workspace()`; `gen_name()` helper.
 - `names.py` — curated single-word name list + collision-avoiding picker.
 - `cli.py` — Typer app, flow orchestration, interactive menu.
 
 ### Conventions to preserve
 
-- All git/tmux interaction shells out to the CLIs (no library bindings);
-  failures surface as `GitError` / `TmuxError` (and `config.ConfigError` for a
-  bad config file), caught centrally in `cli.main()`.
+- All git/tmux/cmux interaction shells out to the CLIs (no library bindings);
+  failures surface as `GitError` / `TmuxError` / `CmuxError` (and
+  `config.ConfigError` for a bad config file), caught centrally in `cli.main()`.
+- The remote vv command must survive three shells (the cmux pane's, `ssh`, and
+  the remote shell). `remote._command_string()` collapses `[vv, *argv]` into one
+  `shlex.join`'d token, then `shlex.join`s the whole `ssh` argv — so URLs with
+  `&`/`?` reach the remote vv intact. Don't hand-build these strings.
 - The worktree name is used as the branch name *and* tmux session name — keep
   `names.WORDS` entries valid as both (no `.`, `:`, `/`, or spaces).
 - `tmux send-keys` targets must use the `=name:` form (trailing colon) for an

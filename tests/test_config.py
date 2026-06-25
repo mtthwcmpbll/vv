@@ -121,3 +121,75 @@ def test_configured_ask_reads_false(monkeypatch, tmp_path):
 def test_configured_ask_ignores_non_boolean_values(monkeypatch, tmp_path):
     _use_config(monkeypatch, tmp_path, 'ask = "yes"\n')
     assert config.configured_ask() is False
+
+
+# --- configured_mode --------------------------------------------------------
+
+def test_configured_mode_defaults_to_local_without_a_file(monkeypatch, tmp_path):
+    monkeypatch.setenv("VV_CONFIG", str(tmp_path / "missing.toml"))
+    assert config.configured_mode() == "local"
+
+
+def test_configured_mode_reads_remote(monkeypatch, tmp_path):
+    _use_config(monkeypatch, tmp_path, 'mode = "remote"\n')
+    assert config.configured_mode() == "remote"
+
+
+def test_configured_mode_unknown_value_falls_back_to_local(monkeypatch, tmp_path):
+    _use_config(monkeypatch, tmp_path, 'mode = "potato"\n')
+    assert config.configured_mode() == "local"
+
+
+# --- configured_remote ------------------------------------------------------
+
+def test_configured_remote_is_none_without_a_table(monkeypatch, tmp_path):
+    _use_config(monkeypatch, tmp_path, 'mode = "remote"\n')
+    assert config.configured_remote() is None
+
+
+def test_configured_remote_parses_full_table(monkeypatch, tmp_path):
+    _use_config(
+        monkeypatch,
+        tmp_path,
+        "[remote]\n"
+        'host = "myserver"\n'
+        'user = "matt"\n'
+        "port = 2222\n"
+        'ssh_options = ["-i", "~/.ssh/id_ed25519"]\n'
+        'vv_command = "~/.local/bin/vv"\n'
+        'cwd = "~/code"\n',
+    )
+    remote = config.configured_remote()
+    assert remote == config.Remote(
+        host="myserver",
+        user="matt",
+        port=2222,
+        ssh_options=("-i", "~/.ssh/id_ed25519"),
+        vv_command="~/.local/bin/vv",
+        cwd="~/code",
+    )
+
+
+def test_configured_remote_defaults_optional_fields(monkeypatch, tmp_path):
+    _use_config(monkeypatch, tmp_path, '[remote]\nhost = "myserver"\n')
+    remote = config.configured_remote()
+    assert remote == config.Remote(host="myserver")
+    assert remote.vv_command == "vv"
+
+
+def test_configured_remote_requires_host(monkeypatch, tmp_path):
+    _use_config(monkeypatch, tmp_path, '[remote]\nuser = "matt"\n')
+    with pytest.raises(config.ConfigError):
+        config.configured_remote()
+
+
+def test_configured_remote_rejects_non_integer_port(monkeypatch, tmp_path):
+    _use_config(monkeypatch, tmp_path, '[remote]\nhost = "h"\nport = "22"\n')
+    with pytest.raises(config.ConfigError):
+        config.configured_remote()
+
+
+def test_configured_remote_rejects_bad_ssh_options(monkeypatch, tmp_path):
+    _use_config(monkeypatch, tmp_path, '[remote]\nhost = "h"\nssh_options = "nope"\n')
+    with pytest.raises(config.ConfigError):
+        config.configured_remote()
