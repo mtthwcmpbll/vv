@@ -111,6 +111,71 @@ def test_send_text_targets_workspace_with_single_token(monkeypatch):
     assert calls[0] == ["send", "--workspace", "ws-9", "--", "bash -lc 'vv --local'\\n"]
 
 
+# --- read_screen ------------------------------------------------------------
+
+def test_read_screen_returns_text_field(monkeypatch):
+    calls = _stub_run(monkeypatch, [_completed(stdout='{"text": "matt@box:~$ "}')])
+    assert cmux_ops.read_screen("ws-1") == "matt@box:~$ "
+    assert calls[0] == ["read-screen", "--workspace", "ws-1", "--json"]
+
+
+def test_read_screen_is_empty_when_unreadable(monkeypatch):
+    _stub_run(monkeypatch, [_completed(returncode=1)])
+    assert cmux_ops.read_screen("ws-1") == ""
+
+
+def test_read_screen_is_empty_on_bad_json(monkeypatch):
+    _stub_run(monkeypatch, [_completed(stdout="not json")])
+    assert cmux_ops.read_screen("ws-1") == ""
+
+
+# --- wait_until_ready -------------------------------------------------------
+
+def _no_real_sleep(monkeypatch):
+    monkeypatch.setattr(cmux_ops.time, "sleep", lambda _s: None)
+
+
+def test_wait_until_ready_returns_true_on_prompt(monkeypatch):
+    _no_real_sleep(monkeypatch)
+    screens = iter(["", "Last login: ...\nmatt@box:~$ "])
+    monkeypatch.setattr(cmux_ops, "read_screen", lambda _w: next(screens))
+    assert cmux_ops.wait_until_ready("ws-1") is True
+
+
+def test_wait_until_ready_accepts_a_quiet_unrecognised_prompt(monkeypatch):
+    _no_real_sleep(monkeypatch)
+    # No prompt sigil, but the screen has gone quiet (same two polls running).
+    screens = iter(["welcome banner", "welcome banner"])
+    monkeypatch.setattr(cmux_ops, "read_screen", lambda _w: next(screens))
+    assert cmux_ops.wait_until_ready("ws-1") is True
+
+
+def test_wait_until_ready_sleeps_the_head_start_delay_first(monkeypatch):
+    slept: list[float] = []
+    monkeypatch.setattr(cmux_ops.time, "sleep", lambda s: slept.append(s))
+    monkeypatch.setattr(cmux_ops, "read_screen", lambda _w: "matt@box:~$ ")
+    assert cmux_ops.wait_until_ready("ws-1", delay=2.0) is True
+    # The 2s head start is slept before any polling; it isn't a poll interval.
+    assert slept and slept[0] == 2.0
+
+
+def test_wait_until_ready_skips_delay_when_zero(monkeypatch):
+    slept: list[float] = []
+    monkeypatch.setattr(cmux_ops.time, "sleep", lambda s: slept.append(s))
+    monkeypatch.setattr(cmux_ops, "read_screen", lambda _w: "matt@box:~$ ")
+    assert cmux_ops.wait_until_ready("ws-1", delay=0.0) is True
+    assert slept == []  # prompt found on first poll, no sleeps at all
+
+
+def test_wait_until_ready_times_out_when_never_ready(monkeypatch):
+    _no_real_sleep(monkeypatch)
+    # An always-blank screen is neither a prompt nor "stable non-empty".
+    monkeypatch.setattr(cmux_ops, "read_screen", lambda _w: "")
+    clock = iter([0.0, 0.5, 1.0, 1.5])  # crosses the 1.0s timeout
+    monkeypatch.setattr(cmux_ops.time, "monotonic", lambda: next(clock))
+    assert cmux_ops.wait_until_ready("ws-1", timeout=1.0) is False
+
+
 # --- _run error handling ----------------------------------------------------
 
 def test_run_raises_when_cmux_is_missing(monkeypatch):

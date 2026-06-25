@@ -112,10 +112,21 @@ TUI has no name in advance, so the tab is titled after the host and the remote
 names its own sessions. The `--name` flag is consumed by the *remote* vv's local
 create flows (`_new_worktree_session` / `_new_chat_session`), which reject an
 already-taken name. Config lives in a single `[remote]` table (`host` required;
-optional `user`, `port`, `identity`, `ssh_options`, `vv_command`) parsed by
-`config.configured_remote()`. `ssh_options` are cmux `--ssh-option` values
-(`-o Key=Value` passthrough), not raw `ssh` argv; cmux ssh also reads
+optional `user`, `port`, `identity`, `ssh_options`, `vv_command`, and the
+prompt-readiness knobs `ready_delay` / `ready_timeout` / `ready_interval`)
+parsed by `config.configured_remote()`. `ssh_options` are cmux `--ssh-option`
+values (`-o Key=Value` passthrough), not raw `ssh` argv; cmux ssh also reads
 `~/.ssh/config`, so host aliases/identities work without extra config.
+
+Before typing the `vv` command into the freshly-opened workspace, `remote.launch`
+calls `cmux_ops.wait_until_ready()` — a just-connected `cmux ssh` shell isn't
+interactive yet, so keystrokes sent mid-startup (the submitting Enter especially)
+get swallowed and the command is left typed-but-unrun. It optionally sleeps
+`ready_delay` seconds up front (for hosts you *know* are slow to log in; default
+`0`), then polls `read-screen` every `ready_interval`s (default `0.4`) up to
+`ready_timeout`s (default `20`) until a shell prompt appears (last on-screen line
+ends in `$`/`#`/`%`/`>`) or the screen goes quiet (non-empty and unchanged across
+two polls). On timeout it warns and sends anyway — no worse than firing blind.
 
 The **agent** is just the command typed into a fresh session, so anything on
 `PATH` works. It is resolved once in `cli.main()` with precedence

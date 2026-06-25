@@ -29,7 +29,7 @@ def _remote_argv(text: str) -> list[str]:
 @pytest.fixture
 def captured(monkeypatch):
     """Stub cmux so nothing real happens; yield the captured ssh + send calls."""
-    seen: dict = {}
+    seen: dict = {"order": []}
     monkeypatch.setattr(remote.cmux_ops, "ensure_available", lambda: None)
 
     def fake_new_ssh(target, *, name=None, port=None, identity=None, ssh_options=()):
@@ -39,12 +39,18 @@ def captured(monkeypatch):
         )
         return "ws-1"
 
+    def fake_wait(workspace_id, **kwargs):
+        seen["order"].append(("wait", workspace_id))
+        seen.update(wait_kwargs=kwargs)
+        return True
+
+    def fake_send(workspace_id, text):
+        seen["order"].append(("send", workspace_id))
+        seen.update(workspace_id=workspace_id, text=text)
+
     monkeypatch.setattr(remote.cmux_ops, "new_ssh_workspace", fake_new_ssh)
-    monkeypatch.setattr(
-        remote.cmux_ops,
-        "send_text",
-        lambda workspace_id, text: seen.update(workspace_id=workspace_id, text=text),
-    )
+    monkeypatch.setattr(remote.cmux_ops, "wait_until_ready", fake_wait)
+    monkeypatch.setattr(remote.cmux_ops, "send_text", fake_send)
     return seen
 
 
@@ -59,6 +65,21 @@ def test_opens_ssh_workspace_then_sends_the_vv_command(captured):
     assert captured["text"].endswith("\\n")
     assert _login_argv(captured["text"]) == ["bash", "-lc", "vv --local"]
     assert _remote_argv(captured["text"]) == ["vv", "--local"]
+    # The command is typed only after the shell is detected ready — never into
+    # a still-connecting workspace where the keystrokes would be lost.
+    assert captured["order"] == [("wait", "ws-1"), ("send", "ws-1")]
+
+
+def test_ready_poll_uses_configured_delay_timeout_and_interval(captured):
+    cfg = config.Remote(
+        host="h", ready_delay=2.0, ready_timeout=30.0, ready_interval=0.5
+    )
+    remote.launch(cfg, remote_argv=["--local"], title="h")
+    assert captured["wait_kwargs"] == {
+        "delay": 2.0,
+        "timeout": 30.0,
+        "interval": 0.5,
+    }
 
 
 def test_user_makes_the_ssh_target(captured):

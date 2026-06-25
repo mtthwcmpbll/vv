@@ -26,6 +26,11 @@ class Remote:
     See :mod:`vv.remote`. Everything here describes the SSH target and how to
     invoke vv on the far side; ``ssh_options`` are cmux ``--ssh-option`` values
     (``-o Key=Value`` passthrough) and ``identity`` an SSH key path.
+    ``ready_delay`` is an unconditional wait before polling begins (use it when
+    you know login takes a second or two); ``ready_timeout`` / ``ready_interval``
+    tune how long (and how often) to then poll the freshly-opened workspace for
+    its shell prompt before typing the ``vv`` command into it (see
+    :func:`vv.cmux_ops.wait_until_ready`).
     """
 
     host: str
@@ -34,6 +39,9 @@ class Remote:
     identity: str | None = None
     ssh_options: tuple[str, ...] = ()
     vv_command: str = "vv"
+    ready_delay: float = 0.0
+    ready_timeout: float = 20.0
+    ready_interval: float = 0.4
 
 
 DEFAULT_WORKSPACES_DIR = Path.home() / ".vv" / "workspaces"
@@ -149,6 +157,11 @@ def configured_remote() -> Remote | None:
     ):
         raise ConfigError("config [remote] 'ssh_options' must be a list of strings")
 
+    defaults = Remote(host=host)
+    ready_delay = _seconds(table, "ready_delay", defaults.ready_delay, allow_zero=True)
+    ready_timeout = _seconds(table, "ready_timeout", defaults.ready_timeout)
+    ready_interval = _seconds(table, "ready_interval", defaults.ready_interval)
+
     return Remote(
         host=host.strip(),
         user=user.strip() if isinstance(user, str) and user.strip() else None,
@@ -160,4 +173,28 @@ def configured_remote() -> Remote | None:
         vv_command=vv_command.strip()
         if isinstance(vv_command, str) and vv_command.strip()
         else "vv",
+        ready_delay=ready_delay,
+        ready_timeout=ready_timeout,
+        ready_interval=ready_interval,
     )
+
+
+def _seconds(table: dict, key: str, default: float, *, allow_zero: bool = False) -> float:
+    """Read ``table[key]`` as a number of seconds, or ``default`` if unset.
+
+    With ``allow_zero`` the value may be ``0`` (a disabled delay); otherwise it
+    must be strictly positive. Booleans are rejected (``bool`` is an ``int``
+    subclass in Python, so they'd slip through a plain numeric check).
+    """
+    value = table.get(key)
+    if value is None:
+        return default
+    invalid = (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or (value < 0 if allow_zero else value <= 0)
+    )
+    if invalid:
+        wanted = "non-negative" if allow_zero else "positive"
+        raise ConfigError(f"config [remote] '{key}' must be a {wanted} number")
+    return float(value)

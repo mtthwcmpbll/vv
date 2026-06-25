@@ -157,7 +157,10 @@ def test_configured_remote_parses_full_table(monkeypatch, tmp_path):
         "port = 2222\n"
         'identity = "~/.ssh/id_ed25519"\n'
         'ssh_options = ["StrictHostKeyChecking=no"]\n'
-        'vv_command = "~/.local/bin/vv"\n',
+        'vv_command = "~/.local/bin/vv"\n'
+        "ready_delay = 2\n"
+        "ready_timeout = 30\n"
+        "ready_interval = 0.5\n",
     )
     remote = config.configured_remote()
     assert remote == config.Remote(
@@ -167,6 +170,9 @@ def test_configured_remote_parses_full_table(monkeypatch, tmp_path):
         identity="~/.ssh/id_ed25519",
         ssh_options=("StrictHostKeyChecking=no",),
         vv_command="~/.local/bin/vv",
+        ready_delay=2.0,
+        ready_timeout=30.0,
+        ready_interval=0.5,
     )
 
 
@@ -175,6 +181,32 @@ def test_configured_remote_defaults_optional_fields(monkeypatch, tmp_path):
     remote = config.configured_remote()
     assert remote == config.Remote(host="myserver")
     assert remote.vv_command == "vv"
+    assert remote.ready_delay == 0.0
+    assert remote.ready_timeout == 20.0
+    assert remote.ready_interval == 0.4
+
+
+def test_configured_remote_allows_zero_ready_delay(monkeypatch, tmp_path):
+    _use_config(monkeypatch, tmp_path, '[remote]\nhost = "h"\nready_delay = 0\n')
+    assert config.configured_remote().ready_delay == 0.0
+
+
+def test_configured_remote_rejects_negative_ready_delay(monkeypatch, tmp_path):
+    _use_config(monkeypatch, tmp_path, '[remote]\nhost = "h"\nready_delay = -1\n')
+    with pytest.raises(config.ConfigError, match="ready_delay"):
+        config.configured_remote()
+
+
+def test_configured_remote_rejects_non_positive_ready_timeout(monkeypatch, tmp_path):
+    _use_config(monkeypatch, tmp_path, '[remote]\nhost = "h"\nready_timeout = 0\n')
+    with pytest.raises(config.ConfigError, match="ready_timeout"):
+        config.configured_remote()
+
+
+def test_configured_remote_rejects_non_numeric_ready_interval(monkeypatch, tmp_path):
+    _use_config(monkeypatch, tmp_path, '[remote]\nhost = "h"\nready_interval = "fast"\n')
+    with pytest.raises(config.ConfigError, match="ready_interval"):
+        config.configured_remote()
 
 
 def test_configured_remote_requires_host(monkeypatch, tmp_path):

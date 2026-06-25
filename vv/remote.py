@@ -8,10 +8,12 @@ worktree/tmux/agent session is created entirely on the remote, "as usual".
 
 Two cmux calls, not one: ``cmux ssh`` opens the workspace (a first-class remote
 connection — cmuxd-remote install, agent notifications, reconnect), and a
-follow-up ``cmux send`` types the ``vv`` command into it. We deliberately don't
-pass the command as a trailing ``ssh`` argument: cmux disables its remote
-bootstrap when a remote command is present, which would forfeit exactly those
-integrations. See :func:`cmux_ops.new_ssh_workspace`.
+follow-up ``cmux send`` types the ``vv`` command into it once the remote shell's
+prompt has appeared (see :func:`cmux_ops.wait_until_ready` — sending mid-startup
+loses the keystrokes). We deliberately don't pass the command as a trailing
+``ssh`` argument: cmux disables its remote bootstrap when a remote command is
+present, which would forfeit exactly those integrations. See
+:func:`cmux_ops.new_ssh_workspace`.
 
 This module is a dumb pipe: :func:`cli.main` decides the remote argv and the tab
 title; we build the ``vv`` command line and hand both to cmux.
@@ -76,10 +78,25 @@ def launch(remote: config.Remote, *, remote_argv: list[str], title: str) -> None
             "sent to the new workspace"
         )
 
+    # Wait for the remote shell's prompt before typing: a just-opened cmux ssh
+    # workspace is still connecting, and characters sent into it during startup
+    # (the submitting Enter especially) get swallowed, leaving the command typed
+    # but unrun. Polling beats blind type-ahead. On timeout we send anyway — no
+    # worse than firing immediately.
+    if not cmux_ops.wait_until_ready(
+        workspace_id,
+        delay=remote.ready_delay,
+        timeout=remote.ready_timeout,
+        interval=remote.ready_interval,
+    ):
+        typer.secho(
+            "  (remote shell not detected as ready; sending anyway)",
+            fg=typer.colors.YELLOW,
+        )
+
     command = _remote_command(remote, remote_argv)
     # A literal "\n" tells cmux to submit the line (it becomes a carriage
-    # return); fired immediately, the remote shell's input buffer holds it until
-    # the SSH session is ready (type-ahead).
+    # return).
     cmux_ops.send_text(workspace_id, f"{command}\\n")
     typer.secho(f"  remote:  {target}", fg=typer.colors.GREEN)
     typer.secho(f"  command: {command}", fg=typer.colors.GREEN)
