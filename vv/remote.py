@@ -1,19 +1,25 @@
 """Remote-launcher mode: run vv on a server, surfaced as a local cmux tab.
 
-In remote mode local vv does no git/tmux work of its own. It opens a cmux
-workspace whose command SSHes into the configured server and runs ``vv`` there,
+In remote mode local vv does no git/tmux work of its own. It opens a native
+cmux SSH workspace to the configured server, then types ``vv`` into it —
 forwarding the user's arguments verbatim — so bare ``vv`` lands you in the
 remote's own interactive TUI and ``vv <url>`` runs the remote create flow. The
 worktree/tmux/agent session is created entirely on the remote, "as usual".
 
+Two cmux calls, not one: ``cmux ssh`` opens the workspace (a first-class remote
+connection — cmuxd-remote install, agent notifications, reconnect), and a
+follow-up ``cmux send`` types the ``vv`` command into it. We deliberately don't
+pass the command as a trailing ``ssh`` argument: cmux disables its remote
+bootstrap when a remote command is present, which would forfeit exactly those
+integrations. See :func:`cmux_ops.new_ssh_workspace`.
+
 This module is a dumb pipe: :func:`cli.main` decides the remote argv and the tab
-title; we just build the ``ssh`` invocation and hand it to cmux.
+title; we build the ``vv`` command line and hand both to cmux.
 """
 
 from __future__ import annotations
 
 import shlex
-from pathlib import Path
 
 import typer
 
@@ -34,32 +40,46 @@ def _ssh_target(remote: config.Remote) -> str:
     return f"{remote.user}@{remote.host}" if remote.user else remote.host
 
 
-def _command_string(remote: config.Remote, remote_argv: list[str]) -> str:
-    """Build the shell command cmux runs: ``ssh -t … <host> '<vv …>'``.
+def _remote_command(remote: config.Remote, remote_argv: list[str]) -> str:
+    """Build the ``vv`` command line typed into the remote shell.
 
-    The remote vv command is collapsed to a single shlex-quoted argument so it
-    survives three layers of parsing — the cmux pane's shell, ``ssh``, then the
-    remote shell — without re-splitting on spaces in URLs or args.
+    The invocation is run through a login shell (``bash -lc``) so the remote's
+    profile is sourced: cmux's interactive remote shell is not guaranteed to be
+    a login shell, and PATH additions like ``~/.local/bin`` (where ``uv tool
+    install`` puts ``vv``) live in ``~/.profile`` — without them the command is
+    "not found". The ``vv`` argv is collapsed to one shlex-quoted token so its
+    spaces (and any ``&``/``?`` in a URL) survive the remote shell intact.
     """
-    remote_command = shlex.join([remote.vv_command, *remote_argv])
-    ssh_argv = ["ssh", "-t", *remote.ssh_options]
-    if remote.port is not None:
-        ssh_argv += ["-p", str(remote.port)]
-    ssh_argv += [_ssh_target(remote), remote_command]
-    return shlex.join(ssh_argv)
+    vv_invocation = shlex.join([remote.vv_command, *remote_argv])
+    return shlex.join(["bash", "-lc", vv_invocation])
 
 
 def launch(remote: config.Remote, *, remote_argv: list[str], title: str) -> None:
-    """Open a cmux workspace that SSHes to ``remote`` and runs ``vv``."""
+    """Open a cmux SSH workspace on ``remote`` and run ``vv`` in it."""
     cmux_ops.ensure_available()
 
-    command = _command_string(remote, remote_argv)
-    cwd = Path(remote.cwd).expanduser() if remote.cwd else Path.cwd()
-
+    target = _ssh_target(remote)
     typer.secho(
-        f"Opening cmux workspace '{title}' → {_ssh_target(remote)}...",
+        f"Opening cmux SSH workspace '{title}' → {target}...",
         fg=typer.colors.CYAN,
     )
-    cmux_ops.new_workspace(cwd, command, title=title)
-    typer.secho(f"  remote:  {_ssh_target(remote)}", fg=typer.colors.GREEN)
+    workspace_id = cmux_ops.new_ssh_workspace(
+        target,
+        name=title,
+        port=remote.port,
+        identity=remote.identity,
+        ssh_options=remote.ssh_options,
+    )
+    if not workspace_id:
+        raise cmux_ops.CmuxError(
+            "cmux ssh did not report a workspace id, so the vv command can't be "
+            "sent to the new workspace"
+        )
+
+    command = _remote_command(remote, remote_argv)
+    # A literal "\n" tells cmux to submit the line (it becomes a carriage
+    # return); fired immediately, the remote shell's input buffer holds it until
+    # the SSH session is ready (type-ahead).
+    cmux_ops.send_text(workspace_id, f"{command}\\n")
+    typer.secho(f"  remote:  {target}", fg=typer.colors.GREEN)
     typer.secho(f"  command: {command}", fg=typer.colors.GREEN)

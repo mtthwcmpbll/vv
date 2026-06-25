@@ -155,18 +155,18 @@ def test_configured_remote_parses_full_table(monkeypatch, tmp_path):
         'host = "myserver"\n'
         'user = "matt"\n'
         "port = 2222\n"
-        'ssh_options = ["-i", "~/.ssh/id_ed25519"]\n'
-        'vv_command = "~/.local/bin/vv"\n'
-        'cwd = "~/code"\n',
+        'identity = "~/.ssh/id_ed25519"\n'
+        'ssh_options = ["StrictHostKeyChecking=no"]\n'
+        'vv_command = "~/.local/bin/vv"\n',
     )
     remote = config.configured_remote()
     assert remote == config.Remote(
         host="myserver",
         user="matt",
         port=2222,
-        ssh_options=("-i", "~/.ssh/id_ed25519"),
+        identity="~/.ssh/id_ed25519",
+        ssh_options=("StrictHostKeyChecking=no",),
         vv_command="~/.local/bin/vv",
-        cwd="~/code",
     )
 
 

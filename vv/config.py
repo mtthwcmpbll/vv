@@ -23,17 +23,17 @@ class ConfigError(RuntimeError):
 class Remote:
     """A remote server vv launches sessions on, in remote-launcher mode.
 
-    See :mod:`vv.remote`. ``cwd`` is the *local* directory the cmux workspace
-    opens in (defaults to the current directory); everything else describes the
-    SSH target and how to invoke vv on the far side.
+    See :mod:`vv.remote`. Everything here describes the SSH target and how to
+    invoke vv on the far side; ``ssh_options`` are cmux ``--ssh-option`` values
+    (``-o Key=Value`` passthrough) and ``identity`` an SSH key path.
     """
 
     host: str
     user: str | None = None
     port: int | None = None
+    identity: str | None = None
     ssh_options: tuple[str, ...] = ()
     vv_command: str = "vv"
-    cwd: str | None = None
 
 
 DEFAULT_WORKSPACES_DIR = Path.home() / ".vv" / "workspaces"
@@ -140,8 +140,8 @@ def configured_remote() -> Remote | None:
         raise ConfigError("config [remote] 'port' must be an integer")
 
     user = table.get("user")
+    identity = table.get("identity")
     vv_command = table.get("vv_command")
-    cwd = table.get("cwd")
 
     raw_options = table.get("ssh_options", [])
     if not isinstance(raw_options, list) or not all(
@@ -153,9 +153,11 @@ def configured_remote() -> Remote | None:
         host=host.strip(),
         user=user.strip() if isinstance(user, str) and user.strip() else None,
         port=port,
+        identity=identity.strip()
+        if isinstance(identity, str) and identity.strip()
+        else None,
         ssh_options=tuple(raw_options),
         vv_command=vv_command.strip()
         if isinstance(vv_command, str) and vv_command.strip()
         else "vv",
-        cwd=cwd.strip() if isinstance(cwd, str) and cwd.strip() else None,
     )

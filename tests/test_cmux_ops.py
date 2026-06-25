@@ -69,37 +69,46 @@ def test_list_titles_degrades_to_empty_on_bad_json(monkeypatch):
     assert cmux_ops.list_workspace_titles() == []
 
 
-# --- new_workspace ----------------------------------------------------------
+# --- new_ssh_workspace ------------------------------------------------------
 
-def test_new_workspace_creates_then_renames_by_id(monkeypatch, tmp_path):
-    calls = _stub_run(monkeypatch, [_completed(stdout='{"id": "ws-123"}')])
-    cmux_ops.new_workspace(tmp_path, "ssh -t h vv", title="falcon")
+def test_new_ssh_workspace_builds_args_and_returns_id(monkeypatch):
+    calls = _stub_run(monkeypatch, [_completed(stdout='{"workspace_id": "ws-123"}')])
+    ws_id = cmux_ops.new_ssh_workspace(
+        "matt@box",
+        name="falcon",
+        port=2222,
+        identity="~/.ssh/id_ed25519",
+        ssh_options=("StrictHostKeyChecking=no",),
+    )
+    assert ws_id == "ws-123"
     assert calls[0] == [
-        "new-workspace", "--cwd", str(tmp_path), "--command", "ssh -t h vv", "--json"
+        "ssh", "matt@box", "--json",
+        "--name", "falcon",
+        "--port", "2222",
+        "--identity", "~/.ssh/id_ed25519",
+        "--ssh-option", "StrictHostKeyChecking=no",
     ]
-    assert calls[1] == ["rename-workspace", "--workspace", "ws-123", "falcon"]
 
 
-def test_new_workspace_without_title_does_not_rename(monkeypatch, tmp_path):
-    calls = _stub_run(monkeypatch, [_completed(stdout='{"id": "ws-1"}')])
-    cmux_ops.new_workspace(tmp_path, "cmd")
-    assert len(calls) == 1
+def test_new_ssh_workspace_omits_unset_flags(monkeypatch):
+    calls = _stub_run(monkeypatch, [_completed(stdout='{"workspace_ref": "workspace:1"}')])
+    ws_id = cmux_ops.new_ssh_workspace("host")
+    assert ws_id == "workspace:1"
+    assert calls[0] == ["ssh", "host", "--json"]
 
 
-def test_new_workspace_falls_back_to_bare_rename_without_id(monkeypatch, tmp_path):
-    # new-workspace --json succeeds but yields no id; rename targets current.
-    calls = _stub_run(monkeypatch, [_completed(stdout="{}")])
-    cmux_ops.new_workspace(tmp_path, "cmd", title="otter")
-    assert calls[1] == ["rename-workspace", "otter"]
+def test_new_ssh_workspace_returns_none_on_unparseable_payload(monkeypatch):
+    _stub_run(monkeypatch, [_completed(stdout="not json")])
+    assert cmux_ops.new_ssh_workspace("host") is None
 
 
-def test_new_workspace_retries_without_json_flag(monkeypatch, tmp_path):
-    # First call (with --json) fails; creation retried plainly, then rename.
-    calls = _stub_run(monkeypatch, [_completed(returncode=1), _completed(), _completed()])
-    cmux_ops.new_workspace(tmp_path, "cmd", title="raven")
-    assert calls[0][-1] == "--json"
-    assert calls[1] == ["new-workspace", "--cwd", str(tmp_path), "--command", "cmd"]
-    assert calls[2] == ["rename-workspace", "raven"]
+# --- send_text --------------------------------------------------------------
+
+def test_send_text_targets_workspace_with_single_token(monkeypatch):
+    calls = _stub_run(monkeypatch, [_completed()])
+    cmux_ops.send_text("ws-9", "bash -lc 'vv --local'\\n")
+    # The command is one token after `--` so its spaces reach the remote shell.
+    assert calls[0] == ["send", "--workspace", "ws-9", "--", "bash -lc 'vv --local'\\n"]
 
 
 # --- _run error handling ----------------------------------------------------

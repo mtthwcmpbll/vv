@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
-from pathlib import Path
+from collections.abc import Sequence
 
 
 class CmuxError(RuntimeError):
@@ -75,43 +75,63 @@ def list_workspace_titles() -> list[str]:
     return titles
 
 
-def new_workspace(cwd: Path, command: str, *, title: str | None = None) -> None:
-    """Create a cmux workspace rooted at ``cwd`` running ``command``.
+def new_ssh_workspace(
+    target: str,
+    *,
+    name: str | None = None,
+    port: int | None = None,
+    identity: str | None = None,
+    ssh_options: Sequence[str] = (),
+) -> str | None:
+    """Open a native cmux SSH workspace for ``target`` and return its id.
 
-    When ``title`` is given the new workspace is renamed to it, so a remote
-    session and its local tab share a name. The new workspace's id is read back
-    from ``new-workspace --json`` to target the rename precisely; if that can't
-    be parsed we fall back to a bare ``rename-workspace`` (which renames the
-    just-created/current workspace).
+    Unlike a local pane that merely runs ``ssh``, ``cmux ssh`` makes the tab a
+    first-class remote connection: it installs cmuxd-remote on the server and
+    wires up agent notifications and session reconnect. That bootstrap only
+    happens when **no** trailing command is passed (a remote command via ``--``
+    turns cmux ssh into a plain ``ssh host cmd``), so we pass none and let the
+    caller drive the session afterwards with :func:`send_text`. The workspace id
+    is read back from ``--json`` so that follow-up can target this workspace
+    precisely; ``None`` if the payload can't be parsed.
+
+    ``ssh_options`` are forwarded one-per ``--ssh-option`` (cmux's ``-o
+    Key=Value`` passthrough); ``port`` / ``identity`` map to ``--port`` /
+    ``--identity``. cmux ssh also reads ``~/.ssh/config``, so host aliases and
+    their identities work without configuring anything here.
     """
-    result = _run(
-        ["new-workspace", "--cwd", str(cwd), "--command", command, "--json"],
-        capture=True,
-        check=False,
-    )
-    # ``--json`` may be unsupported on older builds; retry plainly so creation
-    # still happens. Without it we just can't read back the id.
-    if result.returncode != 0:
-        _run(["new-workspace", "--cwd", str(cwd), "--command", command])
-        workspace_id = None
-    else:
-        workspace_id = _parse_workspace_id(result.stdout)
+    args = ["ssh", target, "--json"]
+    if name:
+        args += ["--name", name]
+    if port is not None:
+        args += ["--port", str(port)]
+    if identity:
+        args += ["--identity", identity]
+    for option in ssh_options:
+        args += ["--ssh-option", option]
+    result = _run(args, capture=True)
+    return _parse_workspace_id(result.stdout)
 
-    if title:
-        if workspace_id:
-            _run(["rename-workspace", "--workspace", workspace_id, title])
-        else:
-            _run(["rename-workspace", title])
+
+def send_text(workspace_id: str, text: str) -> None:
+    """Type ``text`` into ``workspace_id``'s focused surface.
+
+    Used to run a command in a freshly-opened SSH workspace. cmux interprets the
+    escape sequences ``\\n`` / ``\\r`` / ``\\t`` in the text, so a trailing
+    literal ``\\n`` submits the line (it becomes a carriage return). ``text`` is
+    passed as a single token after ``--`` so its spaces and quotes reach the
+    remote shell verbatim — exactly as if the user had typed the command.
+    """
+    _run(["send", "--workspace", workspace_id, "--", text])
 
 
 def _parse_workspace_id(stdout: str | None) -> str | None:
-    """Pull the new workspace's id/ref out of ``new-workspace --json`` output."""
+    """Pull the workspace's id/ref out of a ``cmux … --json`` payload."""
     try:
         data = json.loads(stdout or "")
     except json.JSONDecodeError:
         return None
     if isinstance(data, dict):
-        for key in ("id", "uuid", "ref", "workspace"):
+        for key in ("workspace_id", "workspace_ref", "id", "uuid", "ref", "workspace"):
             value = data.get(key)
             if isinstance(value, str) and value.strip():
                 return value.strip()
