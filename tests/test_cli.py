@@ -27,7 +27,9 @@ def captured(monkeypatch, tmp_path):
     monkeypatch.setattr(
         cli,
         "_start_from_url",
-        lambda url, agent, bypass: seen.update(agent=agent, bypass=bypass),
+        lambda url, agent, bypass, name=None: seen.update(
+            agent=agent, bypass=bypass, name=name
+        ),
     )
     monkeypatch.delenv("VV_AGENT", raising=False)
     monkeypatch.setenv("VV_CONFIG", str(tmp_path / "missing.toml"))
@@ -341,14 +343,16 @@ def test_chat_flag_starts_new_chat_session(monkeypatch, tmp_path):
     seen: dict = {}
     monkeypatch.setattr(
         cli, "_new_chat_session",
-        lambda agent, bypass: seen.update(agent=agent, bypass=bypass),
+        lambda agent, bypass, name=None: seen.update(
+            agent=agent, bypass=bypass, name=name
+        ),
     )
     monkeypatch.delenv("VV_AGENT", raising=False)
     monkeypatch.setenv("VV_CONFIG", str(tmp_path / "missing.toml"))
 
     result = runner.invoke(cli.app, ["--chat", "--agent", "codex"])
     assert result.exit_code == 0, result.output
-    assert seen == {"agent": "codex", "bypass": True}
+    assert seen == {"agent": "codex", "bypass": True, "name": None}
 
 
 def test_chat_flag_rejects_repo_url(monkeypatch, tmp_path):
@@ -357,12 +361,137 @@ def test_chat_flag_rejects_repo_url(monkeypatch, tmp_path):
     monkeypatch.setenv("VV_CONFIG", str(tmp_path / "missing.toml"))
     # Sanity: neither downstream entry point should be reached.
     monkeypatch.setattr(
-        cli, "_new_chat_session", lambda agent, bypass: pytest.fail("called")
+        cli, "_new_chat_session",
+        lambda agent, bypass, name=None: pytest.fail("called"),
     )
     monkeypatch.setattr(
-        cli, "_start_from_url", lambda url, agent, bypass: pytest.fail("called")
+        cli, "_start_from_url",
+        lambda url, agent, bypass, name=None: pytest.fail("called"),
     )
 
     result = runner.invoke(cli.app, ["--chat", _REPO_URL])
     assert result.exit_code == 1
     assert "cannot be combined" in result.output
+
+
+# --- explicit --name (used by remote forwarding) ----------------------------
+
+def test_explicit_name_is_used_when_free(chat_env):
+    cli._new_chat_session("claude", bypass=False, name="otter")
+    assert (chat_env / "wt" / "_chats" / "otter").is_dir()
+
+
+def test_explicit_name_collision_is_rejected(chat_env):
+    import typer
+
+    (chat_env / "wt" / "_chats" / "falcon").mkdir(parents=True)
+    with pytest.raises(typer.Exit):
+        cli._new_chat_session("claude", bypass=False, name="falcon")
+
+
+# --- remote-launcher mode ----------------------------------------------------
+
+@pytest.fixture
+def remote_harness(monkeypatch, tmp_path):
+    """Stub remote.launch / gen_name and make local git/tmux explode.
+
+    Yields ``(seen, write_config)``: ``seen`` records the `remote.launch` call;
+    ``write_config(body)`` drops a config file and points VV_CONFIG at it.
+    """
+    seen: dict = {}
+    monkeypatch.setattr(
+        cli.remote, "launch",
+        lambda remote_cfg, *, remote_argv, title: seen.update(
+            remote=remote_cfg, argv=remote_argv, title=title
+        ),
+    )
+    monkeypatch.setattr(cli.remote, "gen_name", lambda: "otter")
+    monkeypatch.delenv("VV_AGENT", raising=False)
+    monkeypatch.delenv("VV_REMOTE", raising=False)
+
+    def boom(*a, **k):  # noqa: ARG001
+        raise AssertionError("local git/tmux must not run in remote mode")
+
+    for fn in ("clone", "fetch", "add_worktree", "existing_branches"):
+        monkeypatch.setattr(cli.git_ops, fn, boom)
+    monkeypatch.setattr(cli.tmux_ops, "create_session", boom)
+
+    def write_config(body: str) -> None:
+        path = tmp_path / "config.toml"
+        path.write_text(body)
+        monkeypatch.setenv("VV_CONFIG", str(path))
+
+    return seen, write_config
+
+
+def test_remote_flag_routes_bare_vv_to_remote_tui(remote_harness):
+    seen, write_config = remote_harness
+    write_config('[remote]\nhost = "myserver"\n')
+    result = runner.invoke(cli.app, ["--remote"])
+    assert result.exit_code == 0, result.output
+    assert seen["argv"] == ["--local"]      # nothing extra -> remote opens its TUI
+    assert seen["title"] == "myserver"      # generic host title
+    assert seen["remote"].host == "myserver"
+
+
+def test_config_mode_remote_routes_to_remote_launch(remote_harness):
+    seen, write_config = remote_harness
+    write_config('mode = "remote"\n[remote]\nhost = "h"\n')
+    result = runner.invoke(cli.app, [])
+    assert result.exit_code == 0, result.output
+    assert seen["argv"] == ["--local"]
+
+
+def test_local_flag_overrides_config_remote(remote_harness, monkeypatch):
+    seen, write_config = remote_harness
+    write_config('mode = "remote"\n[remote]\nhost = "h"\n')
+    ran: dict = {}
+    monkeypatch.setattr(
+        cli, "_interactive_menu", lambda agent, bypass: ran.setdefault("local", True)
+    )
+    result = runner.invoke(cli.app, ["--local"])
+    assert result.exit_code == 0, result.output
+    assert ran == {"local": True}
+    assert seen == {}                       # remote.launch never called
+
+
+def test_remote_url_forwards_mirrored_name_and_url(remote_harness):
+    seen, write_config = remote_harness
+    write_config('[remote]\nhost = "h"\n')
+    result = runner.invoke(cli.app, ["--remote", _REPO_URL])
+    assert result.exit_code == 0, result.output
+    assert seen["argv"] == ["--name", "otter", "--local", _REPO_URL]
+    assert seen["title"] == "otter"
+
+
+def test_remote_chat_forwards_chat_flag(remote_harness):
+    seen, write_config = remote_harness
+    write_config('[remote]\nhost = "h"\n')
+    result = runner.invoke(cli.app, ["--remote", "--chat"])
+    assert result.exit_code == 0, result.output
+    assert seen["argv"] == ["--name", "otter", "--local", "--chat"]
+
+
+def test_remote_forwards_agent_and_ask(remote_harness):
+    seen, write_config = remote_harness
+    write_config('[remote]\nhost = "h"\n')
+    result = runner.invoke(cli.app, ["--remote", "--agent", "codex", "--ask"])
+    assert result.exit_code == 0, result.output
+    assert seen["argv"] == ["--local", "--agent", "codex", "--ask"]
+
+
+def test_explicit_name_is_forwarded_verbatim(remote_harness):
+    seen, write_config = remote_harness
+    write_config('[remote]\nhost = "h"\n')
+    result = runner.invoke(cli.app, ["--remote", "--name", "raven", _REPO_URL])
+    assert result.exit_code == 0, result.output
+    assert seen["argv"] == ["--name", "raven", "--local", _REPO_URL]
+
+
+def test_remote_mode_without_remote_config_errors(remote_harness):
+    seen, write_config = remote_harness
+    write_config('mode = "remote"\n')      # no [remote] table
+    result = runner.invoke(cli.app, [])
+    assert result.exit_code == 1
+    assert "no [remote] is configured" in result.output
+    assert seen == {}

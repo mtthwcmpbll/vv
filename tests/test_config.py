@@ -121,3 +121,107 @@ def test_configured_ask_reads_false(monkeypatch, tmp_path):
 def test_configured_ask_ignores_non_boolean_values(monkeypatch, tmp_path):
     _use_config(monkeypatch, tmp_path, 'ask = "yes"\n')
     assert config.configured_ask() is False
+
+
+# --- configured_mode --------------------------------------------------------
+
+def test_configured_mode_defaults_to_local_without_a_file(monkeypatch, tmp_path):
+    monkeypatch.setenv("VV_CONFIG", str(tmp_path / "missing.toml"))
+    assert config.configured_mode() == "local"
+
+
+def test_configured_mode_reads_remote(monkeypatch, tmp_path):
+    _use_config(monkeypatch, tmp_path, 'mode = "remote"\n')
+    assert config.configured_mode() == "remote"
+
+
+def test_configured_mode_unknown_value_falls_back_to_local(monkeypatch, tmp_path):
+    _use_config(monkeypatch, tmp_path, 'mode = "potato"\n')
+    assert config.configured_mode() == "local"
+
+
+# --- configured_remote ------------------------------------------------------
+
+def test_configured_remote_is_none_without_a_table(monkeypatch, tmp_path):
+    _use_config(monkeypatch, tmp_path, 'mode = "remote"\n')
+    assert config.configured_remote() is None
+
+
+def test_configured_remote_parses_full_table(monkeypatch, tmp_path):
+    _use_config(
+        monkeypatch,
+        tmp_path,
+        "[remote]\n"
+        'host = "myserver"\n'
+        'user = "matt"\n'
+        "port = 2222\n"
+        'identity = "~/.ssh/id_ed25519"\n'
+        'ssh_options = ["StrictHostKeyChecking=no"]\n'
+        'vv_command = "~/.local/bin/vv"\n'
+        "ready_delay = 2\n"
+        "ready_timeout = 30\n"
+        "ready_interval = 0.5\n",
+    )
+    remote = config.configured_remote()
+    assert remote == config.Remote(
+        host="myserver",
+        user="matt",
+        port=2222,
+        identity="~/.ssh/id_ed25519",
+        ssh_options=("StrictHostKeyChecking=no",),
+        vv_command="~/.local/bin/vv",
+        ready_delay=2.0,
+        ready_timeout=30.0,
+        ready_interval=0.5,
+    )
+
+
+def test_configured_remote_defaults_optional_fields(monkeypatch, tmp_path):
+    _use_config(monkeypatch, tmp_path, '[remote]\nhost = "myserver"\n')
+    remote = config.configured_remote()
+    assert remote == config.Remote(host="myserver")
+    assert remote.vv_command == "vv"
+    assert remote.ready_delay == 0.0
+    assert remote.ready_timeout == 20.0
+    assert remote.ready_interval == 0.4
+
+
+def test_configured_remote_allows_zero_ready_delay(monkeypatch, tmp_path):
+    _use_config(monkeypatch, tmp_path, '[remote]\nhost = "h"\nready_delay = 0\n')
+    assert config.configured_remote().ready_delay == 0.0
+
+
+def test_configured_remote_rejects_negative_ready_delay(monkeypatch, tmp_path):
+    _use_config(monkeypatch, tmp_path, '[remote]\nhost = "h"\nready_delay = -1\n')
+    with pytest.raises(config.ConfigError, match="ready_delay"):
+        config.configured_remote()
+
+
+def test_configured_remote_rejects_non_positive_ready_timeout(monkeypatch, tmp_path):
+    _use_config(monkeypatch, tmp_path, '[remote]\nhost = "h"\nready_timeout = 0\n')
+    with pytest.raises(config.ConfigError, match="ready_timeout"):
+        config.configured_remote()
+
+
+def test_configured_remote_rejects_non_numeric_ready_interval(monkeypatch, tmp_path):
+    _use_config(monkeypatch, tmp_path, '[remote]\nhost = "h"\nready_interval = "fast"\n')
+    with pytest.raises(config.ConfigError, match="ready_interval"):
+        config.configured_remote()
+
+
+def test_configured_remote_requires_host(monkeypatch, tmp_path):
+    _use_config(monkeypatch, tmp_path, '[remote]\nuser = "matt"\n')
+    with pytest.raises(config.ConfigError):
+        config.configured_remote()
+
+
+def test_configured_remote_rejects_non_integer_port(monkeypatch, tmp_path):
+    _use_config(monkeypatch, tmp_path, '[remote]\nhost = "h"\nport = "22"\n')
+    with pytest.raises(config.ConfigError):
+        config.configured_remote()
+
+
+def test_configured_remote_rejects_bad_ssh_options(monkeypatch, tmp_path):
+    _use_config(monkeypatch, tmp_path, '[remote]\nhost = "h"\nssh_options = "nope"\n')
+    with pytest.raises(config.ConfigError):
+        config.configured_remote()

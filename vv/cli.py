@@ -8,7 +8,7 @@ from pathlib import Path
 import questionary
 import typer
 
-from . import agents, config, git_ops, names, tmux_ops
+from . import agents, cmux_ops, config, git_ops, names, remote, tmux_ops
 
 app = typer.Typer(
     add_completion=False,
@@ -121,9 +121,14 @@ def _resume_worktree(name: str, worktree_path: Path, agent: str, bypass: bool) -
 
 
 def _new_worktree_session(
-    repo_name: str, workspace: Path, agent: str, bypass: bool
+    repo_name: str, workspace: Path, agent: str, bypass: bool, name: str | None = None
 ) -> None:
-    """Create a worktree + tmux session for an already-cloned repo and attach."""
+    """Create a worktree + tmux session for an already-cloned repo and attach.
+
+    With no ``name`` a random collision-free one is picked; an explicit ``name``
+    (e.g. forwarded from a remote launcher via ``--name``) is used as-is but
+    must not already be taken.
+    """
     worktree_root = config.worktrees_dir() / repo_name
 
     taken: set[str] = set(tmux_ops.list_sessions())
@@ -131,7 +136,10 @@ def _new_worktree_session(
     if worktree_root.exists():
         taken |= {p.name for p in worktree_root.iterdir()}
 
-    name = names.random_name(taken)
+    if name is None:
+        name = names.random_name(taken)
+    elif name in taken:
+        raise _fail(f"session '{name}' already exists")
     worktree_path = worktree_root / name
 
     start_ref = git_ops.default_start_ref(workspace)
@@ -144,7 +152,7 @@ def _new_worktree_session(
     _resume_worktree(name, worktree_path, agent, bypass)
 
 
-def _new_chat_session(agent: str, bypass: bool) -> None:
+def _new_chat_session(agent: str, bypass: bool, name: str | None = None) -> None:
     """Create an empty chat-only session dir and attach an agent to it.
 
     Chat sessions are not backed by a git worktree — they are just a plain
@@ -155,9 +163,12 @@ def _new_chat_session(agent: str, bypass: bool) -> None:
 
     # Avoid colliding with any existing tmux session or vv session name.
     taken: set[str] = set(tmux_ops.list_sessions())
-    taken |= {name for _repo, name, _path in _list_worktrees()}
+    taken |= {existing for _repo, existing, _path in _list_worktrees()}
 
-    name = names.random_name(taken)
+    if name is None:
+        name = names.random_name(taken)
+    elif name in taken:
+        raise _fail(f"session '{name}' already exists")
     chat_path = chats_root / name
     chat_path.mkdir(parents=True)
 
@@ -165,7 +176,7 @@ def _new_chat_session(agent: str, bypass: bool) -> None:
     _resume_worktree(name, chat_path, agent, bypass)
 
 
-def _start_from_url(repo_url: str, agent: str, bypass: bool) -> None:
+def _start_from_url(repo_url: str, agent: str, bypass: bool, name: str | None = None) -> None:
     """Clone the repo if needed, then create a new worktree session."""
     repo_name = git_ops.repo_name_from_url(repo_url)
     workspace = config.workspaces_dir() / repo_name
@@ -180,7 +191,50 @@ def _start_from_url(repo_url: str, agent: str, bypass: bool) -> None:
         typer.secho(f"Cloning '{repo_name}'...", fg=typer.colors.CYAN)
         git_ops.clone(repo_url, workspace)
 
-    _new_worktree_session(repo_name, workspace, agent, bypass)
+    _new_worktree_session(repo_name, workspace, agent, bypass, name)
+
+
+def _launch_remote(
+    repo_url: str | None,
+    chat: bool,
+    agent: str | None,
+    ask: bool | None,
+    name: str | None,
+) -> None:
+    """Forward this invocation to vv on the configured remote, inside a cmux tab.
+
+    Local vv does no git/tmux work in remote mode: it opens a cmux workspace
+    that SSHes to the server and runs vv there with the same intent. Bare ``vv``
+    forwards nothing extra, so the remote's own interactive TUI opens in the
+    tab; a repo URL / ``--chat`` runs the remote create flow. The ``agent`` /
+    ``ask`` flags are forwarded only when explicitly set, leaving the remote's
+    own config to decide otherwise.
+    """
+    remote_cfg = config.configured_remote()
+    if remote_cfg is None:
+        raise _fail("remote mode is on but no [remote] is configured")
+
+    # Mirror the name only when a session is unambiguously created up front; a
+    # bare `vv` opens the remote TUI, which names its own sessions.
+    session_name = name or (remote.gen_name() if (repo_url or chat) else None)
+
+    forward: list[str] = []
+    if session_name:
+        forward += ["--name", session_name]
+    forward.append("--local")  # the remote must never recurse into remote mode
+    if agent is not None:
+        forward += ["--agent", agent]
+    if ask is True:
+        forward.append("--ask")
+    elif ask is False:
+        forward.append("--no-ask")
+    if chat:
+        forward.append("--chat")
+    if repo_url:
+        forward.append(repo_url)
+
+    title = session_name or remote_cfg.host
+    remote.launch(remote_cfg, remote_argv=forward, title=title)
 
 
 def _resume_session(
@@ -378,6 +432,20 @@ def main(
         help="Start a chat-only session (no git repo). Cannot be combined "
         "with a repo URL.",
     ),
+    remote_mode: bool | None = typer.Option(
+        None,
+        "--remote/--local",
+        envvar="VV_REMOTE",
+        help="Force remote-launcher mode on/off, overriding the config's "
+        "`mode`. Remote mode opens a cmux tab that runs vv on a server.",
+    ),
+    name: str = typer.Option(
+        None,
+        "--name",
+        metavar="NAME",
+        help="Use this exact session/worktree name instead of a random one. "
+        "Forwarded by remote mode so the cmux tab mirrors the remote session.",
+    ),
 ) -> None:
     """Start (or rejoin) a worktree-backed agent session."""
     try:
@@ -388,15 +456,29 @@ def main(
         # an explicit --ask/--no-ask flag overrides the config setting.
         resolved_ask = ask if ask is not None else config.configured_ask()
         bypass = not resolved_ask
+
+        # Remote-launcher mode: the explicit flag wins, else the config decides,
+        # else local. When on, vv does no local work — it forwards to a remote.
+        mode = (
+            "remote" if remote_mode is True
+            else "local" if remote_mode is False
+            else config.configured_mode()
+        )
+        if mode == "remote":
+            if chat and repo_url:
+                raise _fail("--chat cannot be combined with a repo URL")
+            _launch_remote(repo_url, chat, agent, ask, name)
+            return
+
         if chat:
             if repo_url:
                 raise _fail("--chat cannot be combined with a repo URL")
-            _new_chat_session(resolved_agent, bypass)
+            _new_chat_session(resolved_agent, bypass, name)
         elif repo_url:
-            _start_from_url(repo_url, resolved_agent, bypass)
+            _start_from_url(repo_url, resolved_agent, bypass, name)
         else:
             _interactive_menu(resolved_agent, bypass)
-    except (git_ops.GitError, tmux_ops.TmuxError, config.ConfigError) as exc:
+    except (git_ops.GitError, tmux_ops.TmuxError, config.ConfigError, cmux_ops.CmuxError) as exc:
         raise _fail(str(exc)) from exc
     except KeyboardInterrupt:
         typer.secho("\nAborted.", fg=typer.colors.YELLOW, err=True)
