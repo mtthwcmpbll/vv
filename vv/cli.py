@@ -320,36 +320,33 @@ def _menu_list_sessions(default_agent: str, bypass: bool) -> None:
         )
         return
     live = set(tmux_ops.list_sessions())
-    choices: dict[str, tuple[str, str, Path]] = {}
-    for repo, name, path in worktrees:
-        glyph = "●" if name in live else "○"  # running / idle
-        choices[f"{glyph}  {repo}/{name}"] = (repo, name, path)
-    choice = questionary.select(
-        "Which session?  (● running  ○ idle)", choices=list(choices)
-    ).ask()
-    if choice is None:
+    choices = [
+        questionary.Choice(
+            title=f"{'●' if name in live else '○'}  {repo}/{name}",  # running / idle
+            value=(repo, name, path),
+        )
+        for repo, name, path in worktrees
+    ]
+    action, value = _pick_with_delete(
+        "Which session?  (● running  ○ idle · enter to resume · x to delete)",
+        choices,
+    )
+    if action == "cancel":
         return
-    repo, name, path = choices[choice]
-
-    action = questionary.select(
-        f"{repo}/{name} — what would you like to do?",
-        choices=[
-            questionary.Choice(title="↻  Resume", value="resume"),
-            questionary.Choice(title="✕  Delete", value="delete"),
-        ],
-    ).ask()
-    if action == "resume":
-        _resume_session(name, path, default_agent, live, bypass)
-    elif action == "delete":
+    repo, name, path = value
+    if action == "delete":
         _delete_session(repo, name, path, live)
+    else:
+        _resume_session(name, path, default_agent, live, bypass)
 
 
-def _pick_repo(message: str, repos: list[str]) -> tuple[str, str | None]:
-    """Show a repo picker that also accepts ``x`` to delete the highlighted repo.
+def _pick_with_delete(message: str, choices: list) -> tuple[str, object]:
+    """Show a ``select`` that also accepts ``x`` to delete the highlighted choice.
 
-    Returns ``(action, repo)`` where ``action`` is ``"select"`` (start a session
-    from ``repo``), ``"delete"`` (remove ``repo`` from the workspaces dir), or
-    ``"cancel"`` (``repo`` is ``None``) when the user backed out.
+    Returns ``(action, value)`` where ``action`` is ``"select"`` (Enter on the
+    highlighted choice), ``"delete"`` (``x`` pressed on it), or ``"cancel"``
+    (``value`` is ``None``) when the user backed out. ``value`` is the chosen
+    choice's value in the first two cases.
 
     The ``x`` shortcut is wired by reaching into the prompt's prompt_toolkit
     application — questionary's public ``select`` exposes no hook for extra
@@ -357,7 +354,7 @@ def _pick_repo(message: str, repos: list[str]) -> tuple[str, str | None]:
     """
     from questionary.prompts.common import InquirerControl
 
-    question = questionary.select(message, choices=repos)
+    question = questionary.select(message, choices=choices)
     control = next(
         c
         for c in question.application.layout.find_all_controls()
@@ -374,6 +371,16 @@ def _pick_repo(message: str, repos: list[str]) -> tuple[str, str | None]:
     if isinstance(answer, tuple) and answer[0] is _DELETE:
         return "delete", answer[1]
     return "select", answer
+
+
+def _pick_repo(message: str, repos: list[str]) -> tuple[str, str | None]:
+    """Show a repo picker that also accepts ``x`` to delete the highlighted repo.
+
+    Returns ``(action, repo)`` where ``action`` is ``"select"`` (start a session
+    from ``repo``), ``"delete"`` (remove ``repo`` from the workspaces dir), or
+    ``"cancel"`` (``repo`` is ``None``) when the user backed out.
+    """
+    return _pick_with_delete(message, repos)
 
 
 def _delete_repo(repo: str) -> None:
