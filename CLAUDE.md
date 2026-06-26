@@ -81,6 +81,15 @@ attaches. `_list_worktrees()` enumerates worktrees across all cloned repos (via
 "list existing sessions" menu. Chat sessions surface in that listing as
 `(_chats, name, path)` tuples; the sentinel string is `cli.CHATS = "_chats"`.
 
+The "start a new session from an existing repo" menu (`_menu_new_from_repo()`)
+lists cloned repos via `_pick_repo()`, which also binds **`x`** on the
+highlighted repo to delete it wholesale (→ `_delete_repo()`): it confirms,
+listing any worktrees that would be lost (flagged when running / dirty /
+unpushed), then kills their live tmux sessions and `shutil.rmtree`s both the
+per-repo worktrees dir and the workspace clone. (`_pick_repo()` reaches into
+questionary's prompt_toolkit `Application` to add the key — `select` exposes no
+public hook — and returns a `("select" | "delete" | "cancel", repo)` tuple.)
+
 The "list existing sessions" menu (`_menu_list_sessions()`) offers each chosen
 worktree a **resume** (→ `_resume_session()`) or **delete** (→
 `_delete_session()`) action. Deletion first checks `git_ops.is_dirty()` and
