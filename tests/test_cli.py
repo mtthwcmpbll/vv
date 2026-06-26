@@ -485,7 +485,7 @@ def add_repo_harness(monkeypatch):
             cli.gh_ops, "clone_url",
             lambda nwo, proto="ssh": f"{proto}://github.com/{nwo}.git",
         )
-        monkeypatch.setattr(cli, "_pick_repo", lambda _repos: picked)
+        monkeypatch.setattr(cli, "_pick_github_repo", lambda _repos: picked)
         monkeypatch.setattr(cli.questionary, "text", lambda *a, **k: _Answer(typed))
         return seen
 

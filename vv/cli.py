@@ -484,7 +484,7 @@ def _cap_select_rows(question: "questionary.Question", rows: int) -> None:
         pass
 
 
-def _pick_repo(repos: list[str]) -> object | None:
+def _pick_github_repo(repos: list[str]) -> object | None:
     """Show a scrollable, filter-as-you-type list of GitHub repos.
 
     Returns the chosen ``owner/name`` string, the :data:`_ENTER_URL` sentinel
@@ -521,7 +521,7 @@ def _menu_add_repo(default_agent: str, bypass: bool) -> None:
         repos = gh_ops.list_repos()
 
     if repos:
-        picked = _pick_repo(repos)
+        picked = _pick_github_repo(repos)
         if picked is None:
             return
         if picked is _ENTER_URL:

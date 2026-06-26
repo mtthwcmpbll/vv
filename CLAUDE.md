@@ -56,7 +56,7 @@ Four flows, all ending in `_resume_worktree()`:
   chat-only session.
 
 `_menu_add_repo()` shows a scrollable `questionary.select` of every GitHub repo
-the user can access (`_pick_repo()`) when `gh_ops.is_available()` (gh on PATH
+the user can access (`_pick_github_repo()`) when `gh_ops.is_available()` (gh on PATH
 and logged in). Typing filters the `owner/name` list by **substring**
 (`use_search_filter=True`, which forces `use_jk_keys=False`); `_cap_select_rows()`
 limits it to 5 visible rows (it reaches into the prompt_toolkit layout and caps
