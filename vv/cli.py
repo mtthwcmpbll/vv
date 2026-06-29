@@ -195,6 +195,26 @@ def _start_from_url(repo_url: str, agent: str, bypass: bool, name: str | None = 
         typer.secho(f"Cloning '{repo_name}'...", fg=typer.colors.CYAN)
         git_ops.clone(repo_url, workspace)
 
+    # A freshly-created remote has no commits, so its HEAD is unborn and there
+    # is nothing to branch a worktree from. Seed the default branch with an
+    # empty root commit and push it, so worktrees branch off main as usual
+    # (rather than a disposable worktree branch becoming the repo's first
+    # branch). The push is best-effort — a local commit alone is enough to
+    # branch from if the remote can't be reached.
+    if not git_ops.has_head_commit(workspace):
+        typer.secho(
+            "Empty repo — seeding the default branch with an initial commit...",
+            fg=typer.colors.CYAN,
+        )
+        git_ops.seed_initial_commit(workspace)
+        try:
+            git_ops.push_current(workspace)
+        except git_ops.GitError as exc:
+            typer.secho(
+                f"  (push failed, continuing with local commit: {exc})",
+                fg=typer.colors.YELLOW,
+            )
+
     _new_worktree_session(repo_name, workspace, agent, bypass, name)
 
 

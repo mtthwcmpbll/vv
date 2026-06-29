@@ -45,7 +45,13 @@ Four flows, all ending in `_resume_worktree()`:
 
 - **`vv <repo_url>`** → `cli._start_from_url()`: clone into
   `WORKSPACES_DIR/<repo>` (or fetch if already present), then
-  `_new_worktree_session()`.
+  `_new_worktree_session()`. A brand-new remote with no commits clones to an
+  unborn HEAD (nothing to branch from), so when `git_ops.has_head_commit()` is
+  false the default branch is first bootstrapped with an empty root commit
+  (`git_ops.seed_initial_commit()`) and pushed (`git_ops.push_current()`,
+  best-effort — a warning, not fatal, if the remote is unreachable). Worktrees
+  then branch off `main` as usual instead of a disposable worktree branch
+  becoming the repo's first branch.
 - **`vv --chat`** (a.k.a. `-c`) → `cli._new_chat_session()`: create an empty
   directory under `WORKTREES_DIR/_chats/<name>` (no git involved), then
   `_resume_worktree()`. For persistent agent conversations that don't need

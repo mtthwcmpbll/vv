@@ -47,3 +47,16 @@ def remote_repo(tmp_path: Path) -> Path:
     _git("add", "-A", cwd=repo)
     _git("commit", "-q", "-m", "init", cwd=repo)
     return repo
+
+
+@pytest.fixture
+def empty_remote(tmp_path: Path) -> Path:
+    """A bare git repo with no commits — a freshly-created, empty remote.
+
+    Cloning it yields an unborn HEAD with nothing to branch from; being bare it
+    can also be pushed to, mirroring a brand-new GitHub repo.
+    """
+    repo = tmp_path / "empty-remote.git"
+    repo.mkdir()
+    _git("init", "-q", "--bare", "-b", "main", cwd=repo)
+    return repo

@@ -71,6 +71,37 @@ def default_start_ref(workspace: Path) -> str:
     return "HEAD"
 
 
+def has_head_commit(workspace: Path) -> bool:
+    """Return True if HEAD resolves to a commit.
+
+    False for a freshly-cloned empty remote, whose HEAD is unborn (points at a
+    branch that has no commits yet) — nothing can be branched from it.
+    """
+    try:
+        _run(
+            ["git", "-C", str(workspace), "rev-parse", "--verify", "--quiet", "HEAD"],
+            capture=True,
+        )
+    except GitError:
+        return False
+    return True
+
+
+def seed_initial_commit(workspace: Path, *, message: str = "Initial commit") -> None:
+    """Create an empty root commit on the checked-out (default) branch.
+
+    Used to bootstrap an empty clone so worktrees have a real base to branch
+    from. Uses the caller's ambient git identity. Does not push — see
+    :func:`push_current`.
+    """
+    _run(["git", "-C", str(workspace), "commit", "--allow-empty", "-m", message])
+
+
+def push_current(workspace: Path) -> None:
+    """Push the checked-out branch to ``origin``, setting it as upstream."""
+    _run(["git", "-C", str(workspace), "push", "-u", "origin", "HEAD"])
+
+
 def add_worktree(workspace: Path, worktree_path: Path, branch: str, start_ref: str) -> None:
     """Create a new worktree with a fresh branch."""
     worktree_path.parent.mkdir(parents=True, exist_ok=True)

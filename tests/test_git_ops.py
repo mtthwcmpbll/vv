@@ -73,6 +73,46 @@ def test_default_start_ref_falls_back_to_head_without_origin(remote_repo):
     assert git_ops.default_start_ref(remote_repo) == "HEAD"
 
 
+def test_has_head_commit_true_after_clone(remote_repo, tmp_path):
+    clone = tmp_path / "clone"
+    git_ops.clone(str(remote_repo), clone)
+    assert git_ops.has_head_commit(clone) is True
+
+
+def test_has_head_commit_false_for_empty_repo(empty_remote, tmp_path):
+    # A freshly-created remote with no commits clones to an unborn HEAD.
+    clone = tmp_path / "clone"
+    git_ops.clone(str(empty_remote), clone)
+    assert git_ops.has_head_commit(clone) is False
+
+
+def test_seed_initial_commit_and_push_bootstraps_empty_repo(empty_remote, tmp_path):
+    clone = tmp_path / "clone"
+    git_ops.clone(str(empty_remote), clone)
+
+    git_ops.seed_initial_commit(clone)
+    git_ops.push_current(clone)
+
+    # The clone now has a commit on its default branch...
+    assert git_ops.has_head_commit(clone) is True
+    assert "main" in git_ops.existing_branches(clone)
+    # ...and it was pushed to the remote (so the worktree base is shared).
+    remote_branches = subprocess.run(
+        ["git", "-C", str(empty_remote), "branch", "--format=%(refname:short)"],
+        check=True, text=True, capture_output=True,
+    ).stdout.split()
+    assert "main" in remote_branches
+
+    # A worktree branches off the seeded default branch like any normal repo.
+    worktree = tmp_path / "wt" / "falcon"
+    start_ref = git_ops.default_start_ref(clone)
+    git_ops.add_worktree(clone, worktree, branch="falcon", start_ref=start_ref)
+    assert worktree.is_dir()
+    assert "falcon" in git_ops.existing_branches(clone)
+    # The seed commit is already on the remote, so nothing here is unpushed.
+    assert git_ops.unpushed_count(worktree) == 0
+
+
 def test_fetch_succeeds_on_a_clone(remote_repo, tmp_path):
     clone = tmp_path / "clone"
     git_ops.clone(str(remote_repo), clone)
