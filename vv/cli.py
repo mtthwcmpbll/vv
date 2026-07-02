@@ -19,6 +19,10 @@ app = typer.Typer(
 # WORKTREES_DIR/_chats/<name> instead of belonging to a real cloned repo.
 CHATS = "_chats"
 
+# Sentinel returned by the repo picker when the user pressed the delete
+# shortcut instead of selecting a repo to start a session from.
+_DELETE = object()
+
 
 def _fail(message: str) -> "typer.Exit":
     """Print an error and return an Exit to raise."""
@@ -191,6 +195,26 @@ def _start_from_url(repo_url: str, agent: str, bypass: bool, name: str | None = 
         typer.secho(f"Cloning '{repo_name}'...", fg=typer.colors.CYAN)
         git_ops.clone(repo_url, workspace)
 
+    # A freshly-created remote has no commits, so its HEAD is unborn and there
+    # is nothing to branch a worktree from. Seed the default branch with an
+    # empty root commit and push it, so worktrees branch off main as usual
+    # (rather than a disposable worktree branch becoming the repo's first
+    # branch). The push is best-effort — a local commit alone is enough to
+    # branch from if the remote can't be reached.
+    if not git_ops.has_head_commit(workspace):
+        typer.secho(
+            "Empty repo — seeding the default branch with an initial commit...",
+            fg=typer.colors.CYAN,
+        )
+        git_ops.seed_initial_commit(workspace)
+        try:
+            git_ops.push_current(workspace)
+        except git_ops.GitError as exc:
+            typer.secho(
+                f"  (push failed, continuing with local commit: {exc})",
+                fg=typer.colors.YELLOW,
+            )
+
     _new_worktree_session(repo_name, workspace, agent, bypass, name)
 
 
@@ -316,32 +340,130 @@ def _menu_list_sessions(default_agent: str, bypass: bool) -> None:
         )
         return
     live = set(tmux_ops.list_sessions())
-    choices: dict[str, tuple[str, str, Path]] = {}
-    for repo, name, path in worktrees:
-        glyph = "●" if name in live else "○"  # running / idle
-        choices[f"{glyph}  {repo}/{name}"] = (repo, name, path)
-    choice = questionary.select(
-        "Which session?  (● running  ○ idle)", choices=list(choices)
-    ).ask()
-    if choice is None:
+    choices = [
+        questionary.Choice(
+            title=f"{'●' if name in live else '○'}  {repo}/{name}",  # running / idle
+            value=(repo, name, path),
+        )
+        for repo, name, path in worktrees
+    ]
+    action, value = _pick_with_delete(
+        "Which session?  (● running  ○ idle · enter to resume · x to delete)",
+        choices,
+    )
+    if action == "cancel":
         return
-    repo, name, path = choices[choice]
-
-    action = questionary.select(
-        f"{repo}/{name} — what would you like to do?",
-        choices=[
-            questionary.Choice(title="↻  Resume", value="resume"),
-            questionary.Choice(title="✕  Delete", value="delete"),
-        ],
-    ).ask()
-    if action == "resume":
-        _resume_session(name, path, default_agent, live, bypass)
-    elif action == "delete":
+    repo, name, path = value
+    if action == "delete":
         _delete_session(repo, name, path, live)
+    else:
+        _resume_session(name, path, default_agent, live, bypass)
+
+
+def _pick_with_delete(message: str, choices: list) -> tuple[str, object]:
+    """Show a ``select`` that also accepts ``x`` to delete the highlighted choice.
+
+    Returns ``(action, value)`` where ``action`` is ``"select"`` (Enter on the
+    highlighted choice), ``"delete"`` (``x`` pressed on it), or ``"cancel"``
+    (``value`` is ``None``) when the user backed out. ``value`` is the chosen
+    choice's value in the first two cases.
+
+    The ``x`` shortcut is wired by reaching into the prompt's prompt_toolkit
+    application — questionary's public ``select`` exposes no hook for extra
+    keys — and reading the currently highlighted choice off its control.
+    """
+    from questionary.prompts.common import InquirerControl
+
+    question = questionary.select(message, choices=choices)
+    control = next(
+        c
+        for c in question.application.layout.find_all_controls()
+        if isinstance(c, InquirerControl)
+    )
+
+    @question.application.key_bindings.add("x", eager=True)
+    def _request_delete(event) -> None:
+        event.app.exit(result=(_DELETE, control.get_pointed_at().value))
+
+    answer = question.ask()
+    if answer is None:
+        return "cancel", None
+    if isinstance(answer, tuple) and answer[0] is _DELETE:
+        return "delete", answer[1]
+    return "select", answer
+
+
+def _pick_repo(message: str, repos: list[str]) -> tuple[str, str | None]:
+    """Show a repo picker that also accepts ``x`` to delete the highlighted repo.
+
+    Returns ``(action, repo)`` where ``action`` is ``"select"`` (start a session
+    from ``repo``), ``"delete"`` (remove ``repo`` from the workspaces dir), or
+    ``"cancel"`` (``repo`` is ``None``) when the user backed out.
+    """
+    return _pick_with_delete(message, repos)
+
+
+def _delete_repo(repo: str) -> None:
+    """Delete a cloned repo and every worktree/session that belongs to it.
+
+    Always confirms first; if the repo still has worktrees they are listed
+    (flagged when running or holding unsaved work) so the loss is explicit.
+    """
+    workspace = config.workspaces_dir() / repo
+    worktrees = [(name, path) for r, name, path in _list_worktrees() if r == repo]
+    live = set(tmux_ops.list_sessions())
+
+    if worktrees:
+        plural = "" if len(worktrees) == 1 else "s"
+        typer.secho(
+            f"'{repo}' has {len(worktrees)} worktree{plural} that will also be deleted:",
+            fg=typer.colors.YELLOW,
+        )
+        for name, path in worktrees:
+            flags: list[str] = []
+            if name in live:
+                flags.append("running")
+            try:
+                if git_ops.is_dirty(path):
+                    flags.append("uncommitted changes")
+                unpushed = git_ops.unpushed_count(path)
+                if unpushed:
+                    flags.append(f"{unpushed} unpushed")
+            except git_ops.GitError:
+                pass
+            suffix = f"  ({', '.join(flags)})" if flags else ""
+            typer.secho(f"  - {name}{suffix}", fg=typer.colors.YELLOW)
+
+    confirmed = questionary.confirm(
+        f"Delete repo '{repo}' and all of its worktrees? This cannot be undone."
+        if worktrees
+        else f"Delete repo '{repo}'? This cannot be undone.",
+        default=False,
+    ).ask()
+    if not confirmed:
+        typer.secho("Cancelled — repo kept.", fg=typer.colors.CYAN)
+        return
+
+    # The worktree dirs are about to vanish; close any live sessions first.
+    for name, _path in worktrees:
+        if name in live:
+            tmux_ops.kill_session(name)
+
+    # Nuke both the worktrees and the clone wholesale — git's worktree metadata
+    # lives inside the clone we're removing anyway, so no prune is needed.
+    worktrees_root = config.worktrees_dir() / repo
+    if worktrees_root.exists():
+        shutil.rmtree(worktrees_root)
+    shutil.rmtree(workspace)
+    typer.secho(f"Deleted repo '{repo}'.", fg=typer.colors.GREEN)
 
 
 def _menu_new_from_repo(default_agent: str, bypass: bool) -> None:
-    """Pick an already-cloned repo and start a fresh worktree session."""
+    """Pick an already-cloned repo and start a fresh worktree session.
+
+    Pressing ``x`` on a highlighted repo deletes it (and all its worktrees)
+    instead of starting a session.
+    """
     repos = _list_repos()
     if not repos:
         typer.secho(
@@ -349,8 +471,13 @@ def _menu_new_from_repo(default_agent: str, bypass: bool) -> None:
             fg=typer.colors.YELLOW,
         )
         return
-    choice = questionary.select("New session from which repo?", choices=repos).ask()
-    if choice is None:
+    action, choice = _pick_repo(
+        "New session from which repo?  ('x' deletes the highlighted repo)", repos
+    )
+    if action == "cancel":
+        return
+    if action == "delete":
+        _delete_repo(choice)
         return
     agent = _pick_agent(default_agent)
     if agent is None:
@@ -384,7 +511,7 @@ def _cap_select_rows(question: "questionary.Question", rows: int) -> None:
         pass
 
 
-def _pick_repo(repos: list[str]) -> object | None:
+def _pick_github_repo(repos: list[str]) -> object | None:
     """Show a scrollable, filter-as-you-type list of GitHub repos.
 
     Returns the chosen ``owner/name`` string, the :data:`_ENTER_URL` sentinel
@@ -421,7 +548,7 @@ def _menu_add_repo(default_agent: str, bypass: bool) -> None:
         repos = gh_ops.list_repos()
 
     if repos:
-        picked = _pick_repo(repos)
+        picked = _pick_github_repo(repos)
         if picked is None:
             return
         if picked is _ENTER_URL:

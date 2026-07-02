@@ -45,7 +45,13 @@ Four flows, all ending in `_resume_worktree()`:
 
 - **`vv <repo_url>`** → `cli._start_from_url()`: clone into
   `WORKSPACES_DIR/<repo>` (or fetch if already present), then
-  `_new_worktree_session()`.
+  `_new_worktree_session()`. A brand-new remote with no commits clones to an
+  unborn HEAD (nothing to branch from), so when `git_ops.has_head_commit()` is
+  false the default branch is first bootstrapped with an empty root commit
+  (`git_ops.seed_initial_commit()`) and pushed (`git_ops.push_current()`,
+  best-effort — a warning, not fatal, if the remote is unreachable). Worktrees
+  then branch off `main` as usual instead of a disposable worktree branch
+  becoming the repo's first branch.
 - **`vv --chat`** (a.k.a. `-c`) → `cli._new_chat_session()`: create an empty
   directory under `WORKTREES_DIR/_chats/<name>` (no git involved), then
   `_resume_worktree()`. For persistent agent conversations that don't need
@@ -56,7 +62,7 @@ Four flows, all ending in `_resume_worktree()`:
   chat-only session.
 
 `_menu_add_repo()` shows a scrollable `questionary.select` of every GitHub repo
-the user can access (`_pick_repo()`) when `gh_ops.is_available()` (gh on PATH
+the user can access (`_pick_github_repo()`) when `gh_ops.is_available()` (gh on PATH
 and logged in). Typing filters the `owner/name` list by **substring**
 (`use_search_filter=True`, which forces `use_jk_keys=False`); `_cap_select_rows()`
 limits it to 5 visible rows (it reaches into the prompt_toolkit layout and caps
@@ -80,6 +86,15 @@ attaches. `_list_worktrees()` enumerates worktrees across all cloned repos (via
 **plus chat-only sessions** under the `_chats` sentinel namespace, to feed the
 "list existing sessions" menu. Chat sessions surface in that listing as
 `(_chats, name, path)` tuples; the sentinel string is `cli.CHATS = "_chats"`.
+
+The "start a new session from an existing repo" menu (`_menu_new_from_repo()`)
+lists cloned repos via `_pick_repo()`, which also binds **`x`** on the
+highlighted repo to delete it wholesale (→ `_delete_repo()`): it confirms,
+listing any worktrees that would be lost (flagged when running / dirty /
+unpushed), then kills their live tmux sessions and `shutil.rmtree`s both the
+per-repo worktrees dir and the workspace clone. (`_pick_repo()` reaches into
+questionary's prompt_toolkit `Application` to add the key — `select` exposes no
+public hook — and returns a `("select" | "delete" | "cancel", repo)` tuple.)
 
 The "list existing sessions" menu (`_menu_list_sessions()`) offers each chosen
 worktree a **resume** (→ `_resume_session()`) or **delete** (→

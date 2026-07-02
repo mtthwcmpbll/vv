@@ -211,6 +211,77 @@ def test_delete_does_not_kill_when_no_live_session(delete_harness, tmp_path):
     assert calls["killed"] == []
 
 
+# --- _delete_repo (delete a whole cloned repo + its worktrees) ---------------
+
+@pytest.fixture
+def repo_delete_harness(monkeypatch, tmp_path):
+    """Lay out a fake repo + worktrees on disk and stub git/tmux around it."""
+    monkeypatch.setenv("WORKSPACES_DIR", str(tmp_path / "ws"))
+    monkeypatch.setenv("WORKTREES_DIR", str(tmp_path / "wt"))
+
+    workspace = tmp_path / "ws" / "repo"
+    workspace.mkdir(parents=True)
+    worktrees_root = tmp_path / "wt" / "repo"
+
+    calls: dict[str, list] = {"killed": [], "confirms": []}
+    monkeypatch.setattr(cli.tmux_ops, "kill_session",
+                        lambda name: calls["killed"].append(name))
+    monkeypatch.setattr(cli.tmux_ops, "list_sessions", lambda *a, **k: [])
+    monkeypatch.setattr(cli.git_ops, "is_dirty", lambda p: False)
+    monkeypatch.setattr(cli.git_ops, "unpushed_count", lambda p: 0)
+
+    def configure(*, worktrees=(), live=(), confirm=True):
+        paths = []
+        for name in worktrees:
+            p = worktrees_root / name
+            p.mkdir(parents=True)
+            paths.append((name, p))
+        monkeypatch.setattr(
+            cli, "_list_worktrees", lambda: [("repo", n, p) for n, p in paths]
+        )
+        monkeypatch.setattr(cli.tmux_ops, "list_sessions", lambda *a, **k: list(live))
+
+        def fake_confirm(*args, **kwargs):
+            calls["confirms"].append(args[0] if args else "")
+            return _Answer(confirm)
+
+        monkeypatch.setattr(cli.questionary, "confirm", fake_confirm)
+        return calls, workspace, worktrees_root
+
+    return configure
+
+
+def test_delete_repo_removes_clone_and_worktrees(repo_delete_harness):
+    calls, workspace, worktrees_root = repo_delete_harness(worktrees=["falcon"])
+    cli._delete_repo("repo")
+    assert len(calls["confirms"]) == 1     # always confirms
+    assert not workspace.exists()          # clone gone
+    assert not worktrees_root.exists()     # worktrees gone
+
+
+def test_delete_repo_can_be_cancelled(repo_delete_harness):
+    calls, workspace, worktrees_root = repo_delete_harness(
+        worktrees=["falcon"], confirm=False
+    )
+    cli._delete_repo("repo")
+    assert len(calls["confirms"]) == 1
+    assert workspace.exists()              # declined -> nothing removed
+    assert worktrees_root.exists()
+
+
+def test_delete_repo_kills_live_worktree_sessions(repo_delete_harness):
+    calls, _ws, _wt = repo_delete_harness(worktrees=["falcon"], live=["falcon"])
+    cli._delete_repo("repo")
+    assert calls["killed"] == ["falcon"]
+
+
+def test_delete_repo_with_no_worktrees_still_confirms(repo_delete_harness):
+    calls, workspace, _wt = repo_delete_harness(worktrees=[])
+    cli._delete_repo("repo")
+    assert len(calls["confirms"]) == 1
+    assert not workspace.exists()
+
+
 # --- _resume_worktree bypass mode -------------------------------------------
 
 @pytest.fixture
@@ -426,7 +497,7 @@ def add_repo_harness(monkeypatch):
             cli.gh_ops, "clone_url",
             lambda nwo, proto="ssh": f"{proto}://github.com/{nwo}.git",
         )
-        monkeypatch.setattr(cli, "_pick_repo", lambda _repos: picked)
+        monkeypatch.setattr(cli, "_pick_github_repo", lambda _repos: picked)
         monkeypatch.setattr(cli.questionary, "text", lambda *a, **k: _Answer(typed))
         return seen
 
