@@ -209,7 +209,31 @@ is verified; the others in `BYPASS_FLAGS` are best-guesses.
   exact-match session→pane target; `=name` alone fails with "can't find pane".
 - `attach()` uses `switch-client` when already inside tmux (`$TMUX` set) and
   `execvp` to hand over the terminal otherwise — do not replace this with a
-  blocking `subprocess.run`.
+  blocking `subprocess.run`. In the `execvp` branch it first emits an **OSC 7**
+  sequence (`_report_cwd`) reporting the worktree to the enclosing terminal, so
+  cmux/Ghostty (and iTerm2/WezTerm/kitty) show the worktree as the tab's
+  directory instead of wherever vv was launched: tmux consumes the agent's own
+  OSC 7 rather than forwarding it, and no outer shell prompt fires again once
+  tmux takes over, so without this one final OSC 7 the terminal stays frozen on
+  the launch directory. Guarded by `sys.stdout.isatty()`.
+- That one-shot OSC 7 goes stale on any *re*-attach (cmux/SSH reconnect,
+  detach-and-reselect) where vv isn't in the loop to re-send it. So
+  `create_session()` also calls `_setup_cwd_forwarding()`: it turns on the
+  session's `allow-passthrough` option and installs a `client-attached` tmux hook
+  that re-reports the worktree on every attach. Since tmux *swallows* a pane's
+  OSC 7 rather than relaying it, the hook can't just print OSC 7 — it runs
+  `vv --emit-cwd <worktree>` with stdout redirected to the attaching client's
+  `#{pane_tty}`, and `emit_cwd()` prints the OSC 7 wrapped in tmux's DCS
+  **passthrough** (`\ePtmux;<payload-with-ESC-doubled>\e\\`), which tmux unwraps
+  and forwards to the outer terminal. We bake the literal worktree path into the
+  hook, not `#{pane_current_path}`: it's the dir whose branch/PR cmux should show
+  and it avoids forwarding the transient cwd a shell reports mid-rc-file-sourcing
+  when a client attaches during startup. The hook shells out to the absolute vv
+  path (`_self_command()`, resolved via the current PATH); double-quote the vv
+  path and worktree for `/bin/sh` and keep the whole `run-shell` argument
+  single-quote-free so tmux's own single-quoting holds. All of it is best-effort
+  (`check=False`): a pre-3.3 tmux without `allow-passthrough`, or a vv not on
+  PATH, just means no live re-sync. Requires **tmux ≥ 3.3**.
 - vv-created tmux sessions are stamped with the `@vv` session option
   (`tmux_ops.VV_TAG`); `list_sessions(vv_only=True)` filters on it. The
   unfiltered `list_sessions()` feeds collision avoidance, which must consider

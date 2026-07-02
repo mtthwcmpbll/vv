@@ -56,6 +56,18 @@ def test_banner_renders_the_wordmark(capsys):
     assert "◍" in out  # the branch-diagram glyph
 
 
+def test_emit_cwd_short_circuits_to_tmux_ops(monkeypatch):
+    """`vv --emit-cwd PATH` emits and exits without touching the normal flows."""
+    seen: dict = {}
+    monkeypatch.setattr(cli.tmux_ops, "emit_cwd", lambda cwd: seen.update(cwd=cwd))
+    monkeypatch.setattr(
+        cli, "_interactive_menu", lambda *a, **k: pytest.fail("should not run")
+    )
+    result = runner.invoke(cli.app, ["--emit-cwd", "/work/tree"])
+    assert result.exit_code == 0, result.output
+    assert str(seen["cwd"]) == "/work/tree"
+
+
 def test_defaults_to_claude(captured):
     assert captured()["agent"] == "claude"
 
@@ -208,7 +220,7 @@ def sent_command(monkeypatch):
     monkeypatch.setattr(cli.tmux_ops, "session_exists", lambda name: False)
     monkeypatch.setattr(cli.tmux_ops, "create_session", lambda name, cwd: None)
     monkeypatch.setattr(cli.tmux_ops, "send_command", lambda name, cmd: sent.append(cmd))
-    monkeypatch.setattr(cli.tmux_ops, "attach", lambda name: None)
+    monkeypatch.setattr(cli.tmux_ops, "attach", lambda *a, **k: None)
     return sent
 
 

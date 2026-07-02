@@ -7,6 +7,7 @@ exercise output parsing and argument construction in isolation.
 from __future__ import annotations
 
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -60,10 +61,31 @@ def test_session_exists_reflects_return_code(monkeypatch):
 # --- argument construction --------------------------------------------------
 
 def test_create_session_roots_at_cwd_and_stamps_vv_tag(monkeypatch, tmp_path):
+    monkeypatch.setattr(tmux_ops, "_self_command", lambda: "/opt/vv")
     calls = _stub_run(monkeypatch, _completed())
     tmux_ops.create_session("falcon", tmp_path)
     assert calls[0] == ["new-session", "-d", "-s", "falcon", "-c", str(tmp_path)]
     assert calls[1] == ["set-option", "-t", "=falcon:", tmux_ops.VV_TAG, "1"]
+
+
+def test_create_session_enables_passthrough_and_cwd_hook(monkeypatch):
+    monkeypatch.setattr(tmux_ops, "_self_command", lambda: "/opt/vv")
+    calls = _stub_run(monkeypatch, _completed())
+    tmux_ops.create_session("falcon", Path("/work/tree"))
+    assert calls[2] == ["set-option", "-t", "=falcon:", "allow-passthrough", "on"]
+    hook = "run-shell '\"/opt/vv\" --emit-cwd \"/work/tree\" > #{pane_tty}'"
+    assert calls[3] == ["set-hook", "-t", "=falcon:", "client-attached", hook]
+    assert len(calls) == 4
+
+
+def test_create_session_skips_forwarding_when_vv_not_found(monkeypatch, tmp_path):
+    monkeypatch.setattr(tmux_ops, "_self_command", lambda: None)
+    calls = _stub_run(monkeypatch, _completed())
+    tmux_ops.create_session("falcon", tmp_path)
+    assert calls == [
+        ["new-session", "-d", "-s", "falcon", "-c", str(tmp_path)],
+        ["set-option", "-t", "=falcon:", tmux_ops.VV_TAG, "1"],
+    ]
 
 
 def test_send_command_targets_session_with_trailing_colon(monkeypatch):
@@ -91,6 +113,40 @@ def test_attach_execs_tmux_when_outside_tmux(monkeypatch):
     monkeypatch.setattr(tmux_ops.os, "execvp", lambda file, args: execs.append((file, args)))
     tmux_ops.attach("falcon")
     assert execs == [("tmux", ["tmux", "attach-session", "-t", "=falcon"])]
+
+
+def test_attach_reports_cwd_via_osc7_before_handover(monkeypatch, capsys):
+    monkeypatch.delenv("TMUX", raising=False)
+    monkeypatch.setattr(tmux_ops.os, "execvp", lambda file, args: None)
+    monkeypatch.setattr(tmux_ops.sys.stdout, "isatty", lambda: True)
+    monkeypatch.setattr(tmux_ops.socket, "gethostname", lambda: "host")
+    tmux_ops.attach("falcon", Path("/work/tree"))
+    out = capsys.readouterr().out
+    assert out == "\033]7;file://host/work/tree\a"
+
+
+def test_attach_skips_osc7_when_stdout_not_a_tty(monkeypatch, capsys):
+    monkeypatch.delenv("TMUX", raising=False)
+    monkeypatch.setattr(tmux_ops.os, "execvp", lambda file, args: None)
+    monkeypatch.setattr(tmux_ops.sys.stdout, "isatty", lambda: False)
+    tmux_ops.attach("falcon", Path("/work/tree"))
+    assert capsys.readouterr().out == ""
+
+
+# --- emit_cwd (passthrough OSC 7 for the tmux hook) -------------------------
+
+def test_osc7_passthrough_wraps_in_dcs_and_doubles_escapes(monkeypatch):
+    monkeypatch.setattr(tmux_ops.socket, "gethostname", lambda: "host")
+    seq = tmux_ops._osc7_passthrough(Path("/work/tree"))
+    assert seq == "\033Ptmux;\033\033]7;file://host/work/tree\a\033\\"
+
+
+def test_emit_cwd_writes_passthrough_sequence_unconditionally(monkeypatch, capsys):
+    monkeypatch.setattr(tmux_ops.socket, "gethostname", lambda: "host")
+    # No isatty guard: stdout is redirected to the pane tty by the hook.
+    monkeypatch.setattr(tmux_ops.sys.stdout, "isatty", lambda: False)
+    tmux_ops.emit_cwd(Path("/work/tree"))
+    assert capsys.readouterr().out == "\033Ptmux;\033\033]7;file://host/work/tree\a\033\\"
 
 
 # --- _run error handling ----------------------------------------------------

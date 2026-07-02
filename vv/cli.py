@@ -117,7 +117,7 @@ def _resume_worktree(name: str, worktree_path: Path, agent: str, bypass: bool) -
 
     typer.secho(f"  worktree: {worktree_path}", fg=typer.colors.GREEN)
     typer.secho(f"  session:  {name}", fg=typer.colors.GREEN)
-    tmux_ops.attach(name)
+    tmux_ops.attach(name, worktree_path)
 
 
 def _new_worktree_session(
@@ -516,8 +516,21 @@ def main(
         help="Use this exact session/worktree name instead of a random one. "
         "Forwarded by remote mode so the cmux tab mirrors the remote session.",
     ),
+    emit_cwd: str = typer.Option(
+        None,
+        "--emit-cwd",
+        hidden=True,
+        metavar="PATH",
+        help="Internal: print a tmux-passthrough OSC 7 for PATH and exit. "
+        "Invoked by vv's own cwd-forwarding tmux hook.",
+    ),
 ) -> None:
     """Start (or rejoin) a worktree-backed agent session."""
+    # Internal fast path for the cwd-forwarding tmux hook: emit and exit before
+    # any config/mode resolution (it runs on every window switch).
+    if emit_cwd is not None:
+        tmux_ops.emit_cwd(Path(emit_cwd))
+        return
     try:
         # Precedence: --agent flag / $VV_AGENT > config file > built-in default.
         # Typer fills `agent` from $VV_AGENT, with the explicit flag winning.
