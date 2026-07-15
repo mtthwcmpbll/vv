@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import socket
 import subprocess
@@ -15,7 +16,13 @@ class TmuxError(RuntimeError):
     """Raised when a tmux command fails."""
 
 
-def _run(args: list[str], *, capture: bool = False, check: bool = True) -> subprocess.CompletedProcess:
+def _run(
+    args: list[str],
+    *,
+    capture: bool = False,
+    check: bool = True,
+    cwd: str | None = None,
+) -> subprocess.CompletedProcess:
     try:
         return subprocess.run(
             ["tmux", *args],
@@ -23,6 +30,7 @@ def _run(args: list[str], *, capture: bool = False, check: bool = True) -> subpr
             text=True,
             stdout=subprocess.PIPE if capture else None,
             stderr=subprocess.PIPE if capture else None,
+            cwd=cwd,
         )
     except FileNotFoundError as exc:
         raise TmuxError("tmux is not installed or not on PATH") from exc
@@ -75,8 +83,22 @@ def kill_session(name: str) -> None:
 
 
 def create_session(name: str, cwd: Path) -> None:
-    """Create a detached session ``name`` rooted at ``cwd``, tagged as vv's."""
-    _run(["new-session", "-d", "-s", name, "-c", str(cwd)])
+    """Create a detached session ``name`` rooted at ``cwd``, tagged as vv's.
+
+    When this call is what first spawns the tmux server, the server daemon
+    inherits *this process's* working directory as its own — permanently. If vv
+    was launched from inside a disposable worktree/chat dir that later gets
+    deleted, the server is left with a dangling cwd, and a tmux server whose own
+    cwd no longer exists silently ignores the ``-c`` start dir for every new
+    pane (they land in the dead cwd instead). We sidestep that by birthing the
+    server from a stable directory (``~``); the pane still starts at ``cwd`` via
+    ``-c``. Best-effort: if home can't be resolved we just skip the override.
+    """
+    try:
+        server_home: str | None = str(Path.home())
+    except (RuntimeError, OSError):
+        server_home = None
+    _run(["new-session", "-d", "-s", name, "-c", str(cwd)], cwd=server_home)
     _run(["set-option", "-t", f"={name}:", VV_TAG, "1"])
     _setup_cwd_forwarding(name, cwd)
 
@@ -128,12 +150,21 @@ def _self_command() -> str | None:
     return exe if os.path.exists(exe) else None
 
 
-def send_command(name: str, command: str) -> None:
+def send_command(name: str, command: str, *, cwd: Path | None = None) -> None:
     """Type ``command`` followed by Enter into session ``name``.
 
     The trailing colon makes this an exact-match session target that resolves
     to the session's active pane (``send-keys`` targets a pane, not a session).
+
+    When ``cwd`` is given, the command is prefixed with ``cd <cwd> &&`` so the
+    pane recovers into the intended directory even when the tmux session was
+    started on a server whose own cwd is a deleted directory — a state in which
+    tmux ignores the session's ``-c`` start dir and the shell would otherwise
+    launch (and run ``command``) in a dead directory. Redundant on a healthy
+    server; the safety net only bites when ``-c`` was dropped.
     """
+    if cwd is not None:
+        command = f"cd {shlex.quote(str(cwd))} && {command}"
     _run(["send-keys", "-t", f"={name}:", command, "Enter"])
 
 

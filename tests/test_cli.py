@@ -290,7 +290,9 @@ def sent_command(monkeypatch):
     sent: list[str] = []
     monkeypatch.setattr(cli.tmux_ops, "session_exists", lambda name: False)
     monkeypatch.setattr(cli.tmux_ops, "create_session", lambda name, cwd: None)
-    monkeypatch.setattr(cli.tmux_ops, "send_command", lambda name, cmd: sent.append(cmd))
+    monkeypatch.setattr(
+        cli.tmux_ops, "send_command", lambda name, cmd, **_k: sent.append(cmd)
+    )
     monkeypatch.setattr(cli.tmux_ops, "attach", lambda *a, **k: None)
     return sent
 
@@ -308,6 +310,22 @@ def test_resume_worktree_without_bypass_sends_bare_agent(sent_command, tmp_path)
 def test_resume_worktree_bypass_leaves_unknown_agent_unflagged(sent_command, tmp_path):
     cli._resume_worktree("falcon", tmp_path, "agy", bypass=True)
     assert sent_command == ["agy"]
+
+
+def test_resume_worktree_cd_guards_command_into_worktree(monkeypatch, tmp_path):
+    # The launch command must be cd-guarded into the worktree so a poisoned tmux
+    # server (own cwd deleted) can't strand the agent in a dead directory.
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(cli.tmux_ops, "session_exists", lambda name: False)
+    monkeypatch.setattr(cli.tmux_ops, "create_session", lambda name, cwd: None)
+    monkeypatch.setattr(
+        cli.tmux_ops,
+        "send_command",
+        lambda name, cmd, **kw: captured.update(cmd=cmd, cwd=kw.get("cwd")),
+    )
+    monkeypatch.setattr(cli.tmux_ops, "attach", lambda *a, **k: None)
+    cli._resume_worktree("falcon", tmp_path, "claude", bypass=False)
+    assert captured["cwd"] == tmp_path
 
 
 # --- chat-only sessions ------------------------------------------------------

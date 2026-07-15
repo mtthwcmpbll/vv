@@ -68,6 +68,24 @@ def test_create_session_roots_at_cwd_and_stamps_vv_tag(monkeypatch, tmp_path):
     assert calls[1] == ["set-option", "-t", "=falcon:", tmux_ops.VV_TAG, "1"]
 
 
+def test_create_session_births_server_from_stable_home(monkeypatch, tmp_path):
+    # The new-session call must run with cwd=~ so a freshly-spawned tmux server
+    # never inherits a disposable worktree dir as its permanent working dir.
+    monkeypatch.setattr(tmux_ops, "_self_command", lambda: "/opt/vv")
+    monkeypatch.setattr(tmux_ops.Path, "home", staticmethod(lambda: Path("/home/me")))
+    seen: list[tuple[list[str], str | None]] = []
+
+    def fake(args, **kwargs):
+        seen.append((args, kwargs.get("cwd")))
+        return _completed()
+
+    monkeypatch.setattr(tmux_ops, "_run", fake)
+    tmux_ops.create_session("falcon", tmp_path)
+    assert seen[0] == (["new-session", "-d", "-s", "falcon", "-c", str(tmp_path)], "/home/me")
+    # Follow-up option/hook calls carry no cwd override.
+    assert seen[1][1] is None
+
+
 def test_create_session_enables_passthrough_and_cwd_hook(monkeypatch):
     monkeypatch.setattr(tmux_ops, "_self_command", lambda: "/opt/vv")
     calls = _stub_run(monkeypatch, _completed())
@@ -92,6 +110,16 @@ def test_send_command_targets_session_with_trailing_colon(monkeypatch):
     calls = _stub_run(monkeypatch, _completed())
     tmux_ops.send_command("falcon", "claude")
     assert calls == [["send-keys", "-t", "=falcon:", "claude", "Enter"]]
+
+
+def test_send_command_cd_guards_into_cwd_when_given(monkeypatch):
+    # A tmux server whose own cwd was deleted drops the session's -c start dir,
+    # so we prefix an explicit cd to recover the pane into the right directory.
+    calls = _stub_run(monkeypatch, _completed())
+    tmux_ops.send_command("falcon", "claude", cwd=Path("/work/my tree"))
+    assert calls == [
+        ["send-keys", "-t", "=falcon:", "cd '/work/my tree' && claude", "Enter"]
+    ]
 
 
 def test_kill_session_targets_the_session(monkeypatch):

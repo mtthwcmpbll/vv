@@ -117,7 +117,7 @@ def _resume_worktree(name: str, worktree_path: Path, agent: str, bypass: bool) -
                 f"  warning: '{agent}' was not found on PATH", fg=typer.colors.YELLOW
             )
         tmux_ops.create_session(name, worktree_path)
-        tmux_ops.send_command(name, launch)
+        tmux_ops.send_command(name, launch, cwd=worktree_path)
 
     typer.secho(f"  worktree: {worktree_path}", fg=typer.colors.GREEN)
     typer.secho(f"  session:  {name}", fg=typer.colors.GREEN)
