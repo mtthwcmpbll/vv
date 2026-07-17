@@ -147,16 +147,52 @@ def existing_branches(workspace: Path) -> set[str]:
     return {line.strip() for line in out.splitlines() if line.strip()}
 
 
+def status_porcelain(worktree_path: Path) -> str:
+    """Return ``git status --porcelain`` for the worktree (empty if clean).
+
+    Covers staged, unstaged, and untracked files.
+    """
+    return _run(
+        ["git", "-C", str(worktree_path), "status", "--porcelain"],
+        capture=True,
+    )
+
+
 def is_dirty(worktree_path: Path) -> bool:
     """Return True if the worktree has uncommitted changes.
 
     Covers staged, unstaged, and untracked files.
     """
-    out = _run(
-        ["git", "-C", str(worktree_path), "status", "--porcelain"],
+    return bool(status_porcelain(worktree_path))
+
+
+def current_branch(worktree_path: Path) -> str:
+    """Return the short name of the branch checked out in the worktree."""
+    return _run(
+        ["git", "-C", str(worktree_path), "rev-parse", "--abbrev-ref", "HEAD"],
         capture=True,
     )
-    return bool(out)
+
+
+def log_oneline(worktree_path: Path, *, limit: int = 20, unpushed_only: bool = False) -> str:
+    """Return up to ``limit`` recent commits, one ``<sha> <subject>`` per line.
+
+    With ``unpushed_only`` the list is restricted to commits reachable from HEAD
+    but from no remote-tracking ref (the work created in this session that has
+    not been pushed anywhere).
+    """
+    args = ["git", "-C", str(worktree_path), "log", "--oneline", f"-n{limit}", "HEAD"]
+    if unpushed_only:
+        args += ["--not", "--remotes"]
+    return _run(args, capture=True)
+
+
+def diff_stat(worktree_path: Path) -> str:
+    """Return ``git diff --stat`` of the working tree against HEAD (empty if none)."""
+    return _run(
+        ["git", "-C", str(worktree_path), "diff", "--stat", "HEAD"],
+        capture=True,
+    )
 
 
 def unpushed_count(worktree_path: Path) -> int:

@@ -101,6 +101,33 @@ def test_malformed_config_raises_config_error(monkeypatch, tmp_path):
         config.configured_agent()
 
 
+# --- configured_summary_agent -----------------------------------------------
+
+def test_configured_summary_agent_is_none_without_a_file(monkeypatch, tmp_path):
+    monkeypatch.setenv("VV_CONFIG", str(tmp_path / "missing.toml"))
+    assert config.configured_summary_agent() is None
+
+
+def test_configured_summary_agent_reads_the_value(monkeypatch, tmp_path):
+    _use_config(monkeypatch, tmp_path, 'summary_agent = "gemini"\n')
+    assert config.configured_summary_agent() == "gemini"
+
+
+def test_configured_summary_agent_strips_whitespace(monkeypatch, tmp_path):
+    _use_config(monkeypatch, tmp_path, 'summary_agent = "  gemini  "\n')
+    assert config.configured_summary_agent() == "gemini"
+
+
+def test_configured_summary_agent_is_none_when_missing(monkeypatch, tmp_path):
+    _use_config(monkeypatch, tmp_path, 'agent = "claude"\n')
+    assert config.configured_summary_agent() is None
+
+
+def test_configured_summary_agent_is_none_when_not_a_string(monkeypatch, tmp_path):
+    _use_config(monkeypatch, tmp_path, "summary_agent = 42\n")
+    assert config.configured_summary_agent() is None
+
+
 # --- configured_ask ---------------------------------------------------------
 
 def test_configured_ask_is_false_without_a_file(monkeypatch, tmp_path):

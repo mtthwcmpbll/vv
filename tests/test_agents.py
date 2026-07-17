@@ -25,7 +25,7 @@ def test_default_agent_is_a_known_agent():
     ],
 )
 def test_command_of_extracts_executable(agent, expected):
-    assert agents._command_of(agent) == expected
+    assert agents.command_of(agent) == expected
 
 
 def test_installed_agents_filters_and_preserves_known_order(monkeypatch):

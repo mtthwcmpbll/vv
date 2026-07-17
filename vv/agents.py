@@ -38,7 +38,7 @@ BYPASS_FLAGS: dict[str, str] = {
 }
 
 
-def _command_of(agent: str) -> str:
+def command_of(agent: str) -> str:
     """Return the executable name from an agent string (which may have args)."""
     parts = agent.split()
     return parts[0] if parts else agent
@@ -54,7 +54,7 @@ def is_installed(agent: str) -> bool:
 
     Only the first token is checked, so ``"claude --foo"`` tests ``claude``.
     """
-    return shutil.which(_command_of(agent)) is not None
+    return shutil.which(command_of(agent)) is not None
 
 
 def with_bypass(agent: str) -> str:
@@ -63,7 +63,7 @@ def with_bypass(agent: str) -> str:
     Returns ``agent`` unchanged when vv knows no flag for the command, or when
     the flag is already present (so it is safe to call more than once).
     """
-    flag = BYPASS_FLAGS.get(_command_of(agent))
+    flag = BYPASS_FLAGS.get(command_of(agent))
     if not flag or flag in agent:
         return agent
     return f"{agent} {flag}"

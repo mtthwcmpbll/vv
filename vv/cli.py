@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import shutil
+import textwrap
 from datetime import datetime
 from pathlib import Path
 
 import questionary
 import typer
 
-from . import agents, cmux_ops, config, gh_ops, git_ops, names, remote, tmux_ops
+from . import agents, cmux_ops, config, gh_ops, git_ops, names, remote, summary, tmux_ops
 
 app = typer.Typer(
     add_completion=False,
@@ -357,6 +358,92 @@ def _delete_session(repo: str, name: str, path: Path, live: set[str]) -> None:
     typer.secho(f"Deleted worktree '{repo}/{name}'.", fg=typer.colors.GREEN)
 
 
+def _session_summaries(
+    default_agent: str, worktrees: list[tuple[str, str, Path]]
+) -> dict[tuple[str, str], str]:
+    """Return a one-line summary of each session, keyed by ``(repo, name)``.
+
+    Uses the config's ``summary_agent`` (falling back to the session agent) to
+    describe what each worktree/chat is working on. Summaries are cached on disk
+    and only regenerated for sessions whose activity fingerprint has changed
+    since last time (i.e. that have been opened/worked in) — so a menu open is
+    cheap when nothing has moved. Best-effort: if the summary agent can't run
+    non-interactively, or a summary fails, that session shows no description.
+    """
+    summary_agent = config.configured_summary_agent() or default_agent
+    if not summary.can_summarize(summary_agent):
+        return {}
+
+    cache = summary.load_cache()
+    fingerprints = {
+        (repo, name): summary.session_fingerprint(path)
+        for repo, name, path in worktrees
+    }
+    results: dict[tuple[str, str], str] = {}
+    stale: dict[tuple[str, str], Path] = {}
+    for repo, name, path in worktrees:
+        key = (repo, name)
+        entry = cache.get(f"{repo}/{name}")
+        if (
+            entry
+            and entry.get("agent") == summary_agent
+            and entry.get("fingerprint") == fingerprints[key]
+            and entry.get("summary")
+        ):
+            results[key] = entry["summary"]
+        else:
+            stale[key] = path
+
+    if stale:
+        typer.secho(
+            f"Summarizing {len(stale)} session(s) with {summary_agent}...",
+            fg=typer.colors.CYAN,
+        )
+        results.update(summary.summarize_all(summary_agent, stale))
+
+    # Rewrite the cache to exactly the current sessions (pruning deleted ones),
+    # stamping freshly generated summaries with their new fingerprint.
+    new_cache: dict[str, dict] = {}
+    for repo, name, _path in worktrees:
+        key = (repo, name)
+        if key in results:
+            new_cache[f"{repo}/{name}"] = {
+                "agent": summary_agent,
+                "fingerprint": fingerprints[key],
+                "summary": results[key],
+            }
+    summary.save_cache(new_cache)
+    return results
+
+
+#: Indent (spaces) for a session's summary lines, nudging them under the name.
+_SUMMARY_INDENT = 8
+
+
+def _session_title(
+    marker: str, label: str, created: str, summary_text: str | None, width: int | None = None
+) -> str:
+    """Build a session's menu title: a header line, then the summary indented below.
+
+    The summary goes on its own line(s) below the header, and is *manually*
+    wrapped to the terminal width so every wrapped line carries the same
+    :data:`_SUMMARY_INDENT` — prompt_toolkit's own ``wrap_lines`` would restart
+    continuation lines at column 0, which is what made a wrapped summary hard to
+    read. ``width`` defaults to the current terminal width.
+    """
+    header = f"{marker}  {label}  [{created}]"
+    if not summary_text:
+        return header
+    if width is None:
+        width = shutil.get_terminal_size().columns
+    # Wrap to the width left after indenting, with a 1-col margin so a full line
+    # never touches the edge (which would trip prompt_toolkit's own wrapping).
+    text_width = max(width - _SUMMARY_INDENT - 1, 16)
+    pad = " " * _SUMMARY_INDENT
+    lines = textwrap.wrap(summary_text, width=text_width) or [summary_text]
+    return header + "\n" + "\n".join(pad + line for line in lines)
+
+
 def _menu_list_sessions(default_agent: str, bypass: bool) -> None:
     """List existing worktrees; resume or delete the chosen one."""
     worktrees = _list_worktrees()
@@ -367,10 +454,15 @@ def _menu_list_sessions(default_agent: str, bypass: bool) -> None:
         )
         return
     live = set(tmux_ops.list_sessions())
+    summaries = _session_summaries(default_agent, worktrees)
     choices = [
         questionary.Choice(
-            title=f"{'●' if name in live else '○'}  {repo}/{name}"  # running / idle
-            f"  [{_format_created(_created_ts(path))}]",
+            title=_session_title(
+                "●" if name in live else "○",  # running / idle
+                f"{repo}/{name}",
+                _format_created(_created_ts(path)),
+                summaries.get((repo, name)),
+            ),
             value=(repo, name, path),
         )
         for repo, name, path in worktrees
@@ -388,6 +480,28 @@ def _menu_list_sessions(default_agent: str, bypass: bool) -> None:
         _resume_session(name, path, default_agent, live, bypass)
 
 
+def _wrap_choice_lines(question: "questionary.Question") -> None:
+    """Let long choice rows wrap to the terminal width instead of being cut off.
+
+    questionary's choices ``Window`` defaults to ``wrap_lines=False``, so a row
+    wider than the terminal (a session's summary, especially on a narrow mobile
+    terminal) is truncated at the right edge. We flip wrapping on for the window
+    holding the choices; prompt_toolkit then wraps each over-long row. Purely
+    cosmetic — any failure (a questionary/prompt_toolkit internals change) is
+    swallowed, leaving the default truncation.
+    """
+    from prompt_toolkit.filters import to_filter
+
+    try:
+        for container in question.application.layout.walk():
+            content = getattr(container, "content", None)
+            if type(content).__name__ == "InquirerControl":
+                container.wrap_lines = to_filter(True)
+                return
+    except Exception:  # noqa: BLE001 — cosmetic only, never block the prompt
+        pass
+
+
 def _pick_with_delete(message: str, choices: list) -> tuple[str, object]:
     """Show a ``select`` that also accepts ``x`` to delete the highlighted choice.
 
@@ -403,6 +517,7 @@ def _pick_with_delete(message: str, choices: list) -> tuple[str, object]:
     from questionary.prompts.common import InquirerControl
 
     question = questionary.select(message, choices=choices)
+    _wrap_choice_lines(question)
     control = next(
         c
         for c in question.application.layout.find_all_controls()

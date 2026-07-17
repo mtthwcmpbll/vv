@@ -683,3 +683,123 @@ def test_remote_mode_without_remote_config_errors(remote_harness):
     assert result.exit_code == 1
     assert "no [remote] is configured" in result.output
     assert seen == {}
+
+
+# --- session summary caching ------------------------------------------------
+
+def test_session_summaries_only_regenerates_changed_sessions(monkeypatch, tmp_path):
+    from vv import config, summary
+
+    worktrees = [
+        ("repo", "alpha", tmp_path / "alpha"),
+        ("repo", "bravo", tmp_path / "bravo"),
+    ]
+    monkeypatch.setattr(config, "configured_summary_agent", lambda: "claude")
+
+    # In-memory cache that persists across calls (mimics the on-disk file).
+    written = {}
+    monkeypatch.setattr(summary, "save_cache", lambda c: (written.clear(), written.update(c)))
+    monkeypatch.setattr(summary, "load_cache", lambda: dict(written))
+
+    fps = {tmp_path / "alpha": "fp-a1", tmp_path / "bravo": "fp-b1"}
+    monkeypatch.setattr(summary, "session_fingerprint", lambda p: fps[p])
+
+    generated_for = []
+
+    def fake_summarize_all(agent, stale):
+        generated_for.append(sorted(k for k in stale))
+        return {key: f"summary-of-{key[1]}" for key in stale}
+
+    monkeypatch.setattr(summary, "summarize_all", fake_summarize_all)
+
+    # First open: both are new -> both generated.
+    res1 = cli._session_summaries("claude", worktrees)
+    assert res1 == {("repo", "alpha"): "summary-of-alpha", ("repo", "bravo"): "summary-of-bravo"}
+    assert generated_for[-1] == [("repo", "alpha"), ("repo", "bravo")]
+
+    # Second open, nothing changed -> nothing regenerated, results served from cache.
+    res2 = cli._session_summaries("claude", worktrees)
+    assert res2 == res1
+    assert generated_for[-1] == [("repo", "alpha"), ("repo", "bravo")]  # unchanged -> no new call
+    assert len(generated_for) == 1  # summarize_all not called a second time
+
+    # bravo is "opened" (fingerprint changes) -> only bravo regenerates.
+    fps[tmp_path / "bravo"] = "fp-b2"
+    res3 = cli._session_summaries("claude", worktrees)
+    assert generated_for[-1] == [("repo", "bravo")]
+    assert res3[("repo", "alpha")] == "summary-of-alpha"  # alpha still cached
+
+
+def test_session_summaries_prunes_deleted_sessions_from_cache(monkeypatch, tmp_path):
+    from vv import config, summary
+
+    monkeypatch.setattr(config, "configured_summary_agent", lambda: "claude")
+    written = {}
+    monkeypatch.setattr(summary, "save_cache", lambda c: (written.clear(), written.update(c)))
+    monkeypatch.setattr(summary, "load_cache", lambda: dict(written))
+    monkeypatch.setattr(summary, "session_fingerprint", lambda p: "fp")
+    monkeypatch.setattr(
+        summary, "summarize_all",
+        lambda agent, stale: {key: "s" for key in stale},
+    )
+
+    cli._session_summaries("claude", [("r", "a", tmp_path / "a"), ("r", "b", tmp_path / "b")])
+    assert set(written) == {"r/a", "r/b"}
+
+    # 'b' is gone on the next open -> cache no longer carries it.
+    cli._session_summaries("claude", [("r", "a", tmp_path / "a")])
+    assert set(written) == {"r/a"}
+
+
+# --- session menu titles / line wrapping ------------------------------------
+
+def test_session_title_puts_summary_on_an_indented_second_line():
+    title = cli._session_title(
+        "○", "repo/breezy", "07/15/2026 1:34pm", "Refactoring auth flow", width=80
+    )
+    line1, line2 = title.split("\n")
+    assert line1 == "○  repo/breezy  [07/15/2026 1:34pm]"
+    assert line2 == "        Refactoring auth flow"  # 8-space indent, ~under the name
+
+
+def test_session_title_wraps_long_summary_keeping_every_line_indented():
+    summary = (
+        "Diagnose starship prompt sharp end-caps as missing Nerd Font on phone "
+        "and figure out the right fallback glyphs to ship"
+    )
+    title = cli._session_title("○", "_chats/fjord", "07/11/2026 9:50pm", summary, width=40)
+    header, *summary_lines = title.split("\n")
+    assert header == "○  _chats/fjord  [07/11/2026 9:50pm]"
+    assert len(summary_lines) > 1  # it actually wrapped
+    for line in summary_lines:
+        assert line.startswith(" " * 8)          # every wrapped line indented the same
+        assert line[8] != " "                    # indent is exactly 8, content follows
+        assert len(line) <= 40                    # never exceeds the terminal width
+    # the wrapped text reconstructs the original summary
+    assert " ".join(line.strip() for line in summary_lines) == summary
+
+
+def test_session_title_is_single_line_without_a_summary():
+    title = cli._session_title("●", "repo/breezy", "07/15/2026 1:34pm", None)
+    assert "\n" not in title
+    assert title == "●  repo/breezy  [07/15/2026 1:34pm]"
+
+
+def test_wrap_choice_lines_enables_wrapping_on_the_choices_window():
+    import questionary
+
+    q = questionary.select("Which?", choices=[
+        questionary.Choice(title="a\n   long summary line", value=1),
+        questionary.Choice(title="b", value=2),
+    ])
+
+    def choice_window():
+        for c in q.application.layout.walk():
+            if type(getattr(c, "content", None)).__name__ == "InquirerControl":
+                return c
+        return None
+
+    window = choice_window()
+    assert bool(window.wrap_lines()) is False   # questionary's default
+    cli._wrap_choice_lines(q)
+    assert bool(window.wrap_lines()) is True     # flipped on

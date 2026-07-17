@@ -98,7 +98,37 @@ public hook — and returns a `("select" | "delete" | "cancel", repo)` tuple.)
 
 The "list existing sessions" menu (`_menu_list_sessions()`) offers each chosen
 worktree a **resume** (→ `_resume_session()`) or **delete** (→
-`_delete_session()`) action. Deletion first checks `git_ops.is_dirty()` and
+`_delete_session()`) action. Before rendering, `_session_summaries()` produces
+a one-line description of what each session is working on. Summaries are
+**cached** on disk (`config.summary_cache_file()` → `WORKTREES_DIR/.summaries.json`)
+keyed by a cheap *activity fingerprint* (`summary.session_fingerprint()`: the
+session dir's mtime + the driving transcript file's mtime), so on a menu open
+only sessions that have actually changed since last time — been opened and worked
+in — are regenerated; the rest are served from cache. The cache is rewritten to
+exactly the current sessions each open (pruning deleted ones), and entries also
+carry the `agent` they were generated with so switching `summary_agent`
+invalidates them. `_session_title()`
+lays each choice out as a header line (`● repo/name [created]`) with the summary
+on the line(s) below, **manually** wrapped (via `textwrap`) to the terminal width
+and prefixed with `_SUMMARY_INDENT` (8) spaces on *every* wrapped line — so the
+whole summary block stays indented under the name and readable on a narrow mobile
+terminal. `_pick_with_delete()` also calls `_wrap_choice_lines()` to flip the
+questionary choices window to `wrap_lines=True` as a truncation fallback (its
+continuation lines restart at column 0, which is why the summary is pre-wrapped
+rather than relying on it). Summaries come from `summary.summarize_all()`, which runs the
+configured **summary agent** (`config.configured_summary_agent()`, falling back
+to the session agent) in non-interactive "print" mode over each session in
+parallel. The context it feeds that agent (`summary._gather_context()`) blends
+**two sources** so a session is summarizable even with nothing committed: the
+git state (branch + session commits + uncommitted changes/diff, or a chat's file
+listing) **and** the recent agent conversation pulled from the session's
+transcript. The transcript is located by probing each known agent's store in
+order — **Claude, then Gemini, then Codex** — and using the first that has a
+conversation for this session (later agents aren't checked), since vv doesn't
+record which agent ran a session. It is entirely best-effort: if the summary
+agent has no known print-mode invocation (`summary.PRINT_FLAGS`, only `claude`'s
+is verified), no store has a transcript, or every summary fails, the menu just
+shows whatever context it could get (or no description at all). Deletion first checks `git_ops.is_dirty()` and
 `git_ops.unpushed_count()`; if either flags work that would be lost it requires
 a `questionary.confirm()` before proceeding. It then kills any live tmux
 session and runs `git_ops.remove_worktree(force=True)` +
@@ -175,14 +205,45 @@ is verified; the others in `BYPASS_FLAGS` are best-guesses.
 
 - `config.py` — resolves `WORKSPACES_DIR` / `WORKTREES_DIR` and the `VV_CONFIG`
   TOML file (all env-overridable; default under `~/.vv/`). Also exposes
-  `chats_dir()` (= `WORKTREES_DIR/_chats`) for chat-only sessions. Parses the
-  config file (`configured_agent()`, `configured_ask()`, `configured_mode()`,
+  `chats_dir()` (= `WORKTREES_DIR/_chats`) for chat-only sessions and
+  `summary_cache_file()` (= `WORKTREES_DIR/.summaries.json`) for the summary cache. Parses the
+  config file (`configured_agent()`, `configured_summary_agent()`,
+  `configured_ask()`, `configured_mode()`,
   `configured_clone_protocol()` → `ssh`/`https`, `configured_remote()` → the
   `Remote` dataclass); raises `ConfigError` on malformed TOML or a
   half-configured `[remote]`.
 - `agents.py` — `DEFAULT_AGENT`, the `KNOWN_AGENTS` list seeding the picker,
   `PATH` detection (`installed_agents()`, `is_installed()`), and the
   `BYPASS_FLAGS` map + `with_bypass()`.
+- `summary.py` — generates the one-line session summaries shown in the "list
+  existing sessions" menu. `PRINT_FLAGS` maps an agent command to the tokens
+  that run it non-interactively (only `claude`'s is verified); `summarize()`
+  feeds a session's context to that agent and keeps the first printed line;
+  `summarize_all()` fans out over sessions with a thread pool. Context comes
+  from both git (`_git_context`/`_dir_context`) and the session's agent
+  transcript (`_transcript_context`), which probes each agent's store in order
+  (`_claude_messages` → `_gemini_messages` → `_codex_messages`) and renders the
+  first that yields turns (`_render_messages` keeps the first + last few *real*
+  user/assistant turns; tool calls and slash/bash-command turns filtered out via
+  `_clean_turn`). Each store is located differently — Claude by encoding the cwd
+  into a `~/.claude/projects/<encoded>` dir name (`_encode_project_path`); Gemini
+  by mapping the cwd through `~/.gemini/projects.json` to a tag dir under
+  `~/.gemini/tmp/<tag>/chats`; Codex by scanning `~/.codex/sessions` newest-first
+  for a `rollout-*.jsonl` whose header `cwd` matches. All the store locations are
+  module constants (overridable in tests). Best-effort throughout — never raises,
+  returns `None`/`{}`/`""` on any failure. Also owns the summary **cache**
+  (`session_fingerprint()`, `load_cache()`, `save_cache()`); the fingerprint
+  reuses the same per-agent transcript file-finders (`_claude_file` /
+  `_gemini_file` / `_codex_file`, factored out of the message providers) via
+  `_transcript_path()` so it reflects the file that actually drives the summary.
+  Two subtleties keep the cache and summaries honest: (1) `summarize()` runs the
+  agent in an isolated scratch dir (`_scratch_cwd()` → `WORKTREES_DIR/.summary-scratch`),
+  never the session — agent CLIs persist a transcript for their cwd, so running
+  in-session would pollute the very history we read back and bump the fingerprint
+  on every run (the context is all passed in the prompt, so no session access is
+  needed); (2) `_claude_file()` skips transcripts that are vv's *own* summary
+  runs (`_is_summary_run()`, detected by the `_SUMMARY_MARKER` opening of
+  `_PROMPT`), so a summary never feeds on a previous summary.
 - `git_ops.py` — `git` CLI wrappers; raises `GitError`.
 - `gh_ops.py` — optional `gh` (GitHub CLI) wrappers powering the "Add a new
   repo" picker: `is_available()` (on PATH **and** authenticated),

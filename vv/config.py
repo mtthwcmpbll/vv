@@ -76,6 +76,16 @@ def chats_dir() -> Path:
     return path
 
 
+def summary_cache_file() -> Path:
+    """Path to the JSON cache of generated session summaries.
+
+    Lives inside :func:`worktrees_dir` (a hidden file at its root) so it follows
+    the same ``WORKTREES_DIR`` override and never collides with a repo's
+    worktree subdirectory.
+    """
+    return worktrees_dir() / ".summaries.json"
+
+
 def config_file() -> Path:
     """Path to the vv TOML config file (override with ``VV_CONFIG``)."""
     raw = os.environ.get("VV_CONFIG")
@@ -103,6 +113,20 @@ def _load_config() -> dict:
 def configured_agent() -> str | None:
     """Return the ``agent`` set in the config file, if any."""
     value = _load_config().get("agent")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def configured_summary_agent() -> str | None:
+    """Return the ``summary_agent`` set in the config file, if any.
+
+    This is the agent CLI vv uses to generate the one-line session summaries
+    shown in the "list existing sessions" menu — same command format as
+    ``agent`` (anything on ``PATH``). When unset, vv falls back to the session
+    ``agent`` for summaries.
+    """
+    value = _load_config().get("summary_agent")
     if isinstance(value, str) and value.strip():
         return value.strip()
     return None
