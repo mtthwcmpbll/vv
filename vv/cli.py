@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+from datetime import datetime
 from pathlib import Path
 
 import questionary
@@ -36,11 +37,36 @@ def _list_repos() -> list[str]:
     return sorted(p.name for p in root.iterdir() if p.is_dir())
 
 
+def _created_ts(path: Path) -> float:
+    """Return the session's creation time as a Unix timestamp.
+
+    Uses the worktree/chat directory's birth time where the platform exposes it
+    (macOS ``st_birthtime``), falling back to the mtime otherwise. Returns
+    ``0.0`` if the path can't be stat'd, so ordering never crashes on a session
+    that vanished underfoot.
+    """
+    try:
+        st = path.stat()
+    except OSError:
+        return 0.0
+    return getattr(st, "st_birthtime", None) or st.st_mtime
+
+
+def _format_created(ts: float) -> str:
+    """Format a creation timestamp as e.g. ``07/15/2026 1:34pm``."""
+    dt = datetime.fromtimestamp(ts)
+    hour = dt.hour % 12 or 12
+    return f"{dt:%m/%d/%Y} {hour}:{dt:%M}{'am' if dt.hour < 12 else 'pm'}"
+
+
 def _list_worktrees() -> list[tuple[str, str, Path]]:
     """Return ``(repo, name, path)`` for every vv session across all repos.
 
     Chat-only sessions (no git worktree) are surfaced under the sentinel
     :data:`CHATS` namespace so the same menu can resume / delete them.
+
+    Ordered by repo, then most-recently-created first within each repo, so the
+    newest sessions for a repo (usually what you just spun up) sort to the top.
     """
     worktrees_root = config.worktrees_dir()
     found: list[tuple[str, str, Path]] = []
@@ -60,7 +86,8 @@ def _list_worktrees() -> list[tuple[str, str, Path]]:
     for path in sorted(config.chats_dir().iterdir()):
         if path.is_dir():
             found.append((CHATS, path.name, path))
-    return sorted(found)
+    # repo ascending, creation time descending (newest first), name as tiebreak.
+    return sorted(found, key=lambda w: (w[0], -_created_ts(w[2]), w[1]))
 
 
 def _pick_agent(default: str) -> str | None:
@@ -342,7 +369,8 @@ def _menu_list_sessions(default_agent: str, bypass: bool) -> None:
     live = set(tmux_ops.list_sessions())
     choices = [
         questionary.Choice(
-            title=f"{'●' if name in live else '○'}  {repo}/{name}",  # running / idle
+            title=f"{'●' if name in live else '○'}  {repo}/{name}"  # running / idle
+            f"  [{_format_created(_created_ts(path))}]",
             value=(repo, name, path),
         )
         for repo, name, path in worktrees
