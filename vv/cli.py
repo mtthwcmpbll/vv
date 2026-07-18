@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import shutil
 import textwrap
+import threading
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
 import questionary
 import typer
 
-from . import agents, cmux_ops, config, gh_ops, git_ops, names, remote, summary, tmux_ops
+from . import agents, cmux_ops, config, gh_ops, git_ops, names, pr, remote, summary, tmux_ops
 
 app = typer.Typer(
     add_completion=False,
@@ -416,36 +418,8 @@ def _session_summaries(
     return results
 
 
-#: Indent (spaces) for a session's summary lines, nudging them under the name.
-_SUMMARY_INDENT = 8
-
-
-def _session_title(
-    marker: str, label: str, created: str, summary_text: str | None, width: int | None = None
-) -> str:
-    """Build a session's menu title: a header line, then the summary indented below.
-
-    The summary goes on its own line(s) below the header, and is *manually*
-    wrapped to the terminal width so every wrapped line carries the same
-    :data:`_SUMMARY_INDENT` — prompt_toolkit's own ``wrap_lines`` would restart
-    continuation lines at column 0, which is what made a wrapped summary hard to
-    read. ``width`` defaults to the current terminal width.
-    """
-    header = f"{marker}  {label}  [{created}]"
-    if not summary_text:
-        return header
-    if width is None:
-        width = shutil.get_terminal_size().columns
-    # Wrap to the width left after indenting, with a 1-col margin so a full line
-    # never touches the edge (which would trip prompt_toolkit's own wrapping).
-    text_width = max(width - _SUMMARY_INDENT - 1, 16)
-    pad = " " * _SUMMARY_INDENT
-    lines = textwrap.wrap(summary_text, width=text_width) or [summary_text]
-    return header + "\n" + "\n".join(pad + line for line in lines)
-
-
 def _menu_list_sessions(default_agent: str, bypass: bool) -> None:
-    """List existing worktrees; resume or delete the chosen one."""
+    """List existing worktrees as cards; resume or delete the chosen one."""
     worktrees = _list_worktrees()
     if not worktrees:
         typer.secho(
@@ -455,21 +429,42 @@ def _menu_list_sessions(default_agent: str, bypass: bool) -> None:
         return
     live = set(tmux_ops.list_sessions())
     summaries = _session_summaries(default_agent, worktrees)
-    choices = [
-        questionary.Choice(
-            title=_session_title(
-                "●" if name in live else "○",  # running / idle
-                f"{repo}/{name}",
-                _format_created(_created_ts(path)),
-                summaries.get((repo, name)),
-            ),
-            value=(repo, name, path),
-        )
-        for repo, name, path in worktrees
-    ]
-    action, value = _pick_with_delete(
-        "Which session?  (● running  ○ idle · enter to resume · x to delete)",
+
+    # PR status: serve whatever is cached instantly, then refresh the rest in the
+    # background while the menu is open (see `_pick_session`), so opening the view
+    # never blocks on `gh`.
+    session_paths = {(repo, name): path for repo, name, path in worktrees}
+    pr_snapshot = pr.Snapshot(session_paths)
+    pr_cached = pr_snapshot.cached
+    pr_stale = pr_snapshot.stale_keys
+
+    cards: list[dict] = []
+    choices: list[questionary.Choice] = []
+    card_by_key: dict[tuple[str, str], dict] = {}
+    for repo, name, path in worktrees:
+        is_git = (path / ".git").exists()
+        key = (repo, name)
+        card = {
+            "running": name in live,
+            "summary": summaries.get(key),
+            "branch": name if is_git else None,  # vv's worktree branch is its name
+            "dirty": _worktree_dirty(path) if is_git else False,
+            "folder": f"{repo}/{name}",
+            "pr": pr_cached.get(key),
+            "pr_pending": key in pr_stale,  # awaiting a background refresh
+            "when": _relative_time(_created_ts(path)),
+        }
+        cards.append(card)
+        card_by_key[key] = card
+        choices.append(questionary.Choice(title=f"{repo}/{name}", value=(repo, name, path)))
+
+    action, value = _pick_session(
+        "Sessions  ·  enter to resume · x to delete",
         choices,
+        cards,
+        pr_snapshot,
+        card_by_key,
+        _card_theme(),
     )
     if action == "cancel":
         return
@@ -478,6 +473,398 @@ def _menu_list_sessions(default_agent: str, bypass: bool) -> None:
         _delete_session(repo, name, path, live)
     else:
         _resume_session(name, path, default_agent, live, bypass)
+
+
+# --- session cards ----------------------------------------------------------
+
+#: Fixed inner chrome per card row: "│ " (2) on the left, " │" (2) on the right.
+_CARD_CHROME = 4
+#: Left gutter reserved for the selection bar ("▌ " / "  ").
+_CARD_GUTTER = 2
+#: Right slack so an over-wide glyph can't clip card content against the border.
+_CARD_RIGHT_MARGIN = 2
+#: Cushion kept *inside* the card before the right-aligned timestamp, so a glyph
+#: a terminal renders wider than we measured eats slack instead of clipping text.
+_CARD_TEXT_SLACK = 3
+#: Cap on card width so lines don't sprawl on a very wide terminal.
+_CARD_MAX_WIDTH = 74
+
+#: Default card glyphs. Each is overridable from the config's ``[cards.glyphs]``
+#: table (see :func:`config.configured_card_glyphs`). Keep overrides single-cell
+#: so the layout stays aligned (``separator`` is the exception — it carries its
+#: own spaces).
+_DEFAULT_GLYPHS: dict[str, str] = {
+    "running": "▸",        # live session (filled right triangle)
+    "idle": "▹",           # idle session (outline right triangle)
+    "dirty": "✱",          # uncommitted/unpushed marker after the branch
+    "separator": " · ",    # between branch and folder
+    "chat": "❝",           # chat-session line
+    "pr_open": "○",        # open PR (outline circle)
+    "pr_draft": "◌",       # draft PR (dotted circle)
+    "pr_merged": "●",      # merged PR (filled circle)
+    "pr_closed": "⊘",      # closed PR
+    "pr_none": "○",        # git session with no PR
+    "pr_checking": "⋯",    # PR status refresh in flight
+    "check_passing": "✓",  # CI checks passing
+    "check_failing": "✗",  # CI checks failing
+    "check_pending": "◔",  # CI checks running
+    "select_pointer": "❯", # selected card, top row
+    "select_bar": "▌",     # selected card, other rows
+}
+
+#: Default card colors (prompt_toolkit style strings), overridable from the
+#: config's ``[cards.colors]`` table (see :func:`config.configured_card_colors`).
+_DEFAULT_COLORS: dict[str, str] = {
+    "border": "ansibrightblack",
+    "bar": "ansicyan bold",
+    "running": "ansigreen bold",
+    "idle": "ansibrightblack",
+    "title": "bold",
+    "branch": "ansicyan",
+    "dirty": "ansiyellow bold",
+    "folder": "ansibrightblack",
+    "time": "ansibrightblack",
+    "selection": "bg:#334155",
+    "pr_pass": "ansigreen",
+    "pr_fail": "ansired",
+    "pr_pending": "ansiyellow",
+    "pr_open": "ansicyan",
+    "pr_draft": "ansibrightblack",
+    "pr_merged": "ansimagenta",
+    "pr_closed": "ansired",
+    "pr_none": "ansibrightblack",
+}
+
+
+@dataclass(frozen=True)
+class CardTheme:
+    """The glyphs and colors used to render session cards."""
+
+    glyphs: dict[str, str]
+    colors: dict[str, str]
+
+
+#: Theme with everything at its default; the fallback when no config overrides.
+_DEFAULT_THEME = CardTheme(_DEFAULT_GLYPHS, _DEFAULT_COLORS)
+
+
+def _card_theme() -> CardTheme:
+    """Build the card theme, layering the config's overrides over the defaults."""
+    return CardTheme(
+        glyphs={**_DEFAULT_GLYPHS, **config.configured_card_glyphs()},
+        colors={**_DEFAULT_COLORS, **_valid_colors(config.configured_card_colors())},
+    )
+
+
+def _valid_colors(overrides: dict[str, str]) -> dict[str, str]:
+    """Keep only color overrides prompt_toolkit can parse.
+
+    A malformed style string (e.g. a typo'd color name) raises when
+    prompt_toolkit resolves it *at render time*, which would crash the menu — so
+    we probe each value here and silently drop the bad ones, leaving the default.
+    """
+    from prompt_toolkit.styles import Style
+
+    good: dict[str, str] = {}
+    for key, value in overrides.items():
+        try:
+            Style([("_probe", value)]).get_attrs_for_style_str("class:_probe")
+        except ValueError:
+            continue  # invalid style string -> fall back to the default for this key
+        good[key] = value
+    return good
+
+
+def _worktree_dirty(path: Path) -> bool:
+    """True if the worktree has uncommitted or unpushed work (the ``*`` marker).
+
+    Best-effort and local-only (no network): any git error just means no marker.
+    """
+    try:
+        return git_ops.is_dirty(path) or git_ops.unpushed_count(path) > 0
+    except git_ops.GitError:
+        return False
+
+
+def _relative_time(ts: float) -> str:
+    """Format a Unix timestamp as a compact relative age, e.g. ``3d ago``."""
+    import time
+
+    secs = max(0.0, time.time() - ts)
+    for unit, size in (("w", 604800), ("d", 86400), ("h", 3600), ("m", 60)):
+        if secs >= size:
+            return f"{int(secs // size)}{unit} ago"
+    return "just now"
+
+
+#: PR state -> (glyph key, style class). Draft/merged/closed carry no check
+#: overlay. The default circle family (dotted=draft, outline=open, filled=merged)
+#: plus a circled slash for closed is themeable; glyphs come from the theme.
+_PR_STATE_STYLE = {
+    "draft": ("pr_draft", "class:card.pr.draft"),
+    "merged": ("pr_merged", "class:card.pr.merged"),
+    "closed": ("pr_closed", "class:card.pr.closed"),
+}
+#: Check rollup -> (glyph key, word, style class) for an open PR.
+_PR_CHECK_STYLE = {
+    "passing": ("check_passing", "passing", "class:card.pr.pass"),
+    "failing": ("check_failing", "failing", "class:card.pr.fail"),
+    "pending": ("check_pending", "pending", "class:card.pr.pending"),
+}
+
+
+def _pr_segment(card: dict, theme: "CardTheme | None" = None) -> tuple[str, str]:
+    """Return ``(text, style_class)`` for a card's PR-status line."""
+    g = (theme or _DEFAULT_THEME).glyphs
+    if card["branch"] is None:
+        return f"{g['chat']} chat session", "class:card.pr.none"
+    pr_info = card["pr"]
+    if not pr_info and card.get("pr_pending"):
+        return f"{g['pr_checking']} checking…", "class:card.pr.none"  # refresh in flight
+    if not pr_info:
+        return f"{g['pr_none']} no open PR", "class:card.pr.none"
+    number = pr_info.get("number")
+    state = pr_info.get("state", "open")
+    if state in _PR_STATE_STYLE:  # draft / merged / closed carry no check overlay
+        glyph_key, style = _PR_STATE_STYLE[state]
+        return f"{g[glyph_key]} PR #{number} {state}", style
+    # Open: the state glyph, then the check rollup drives the trailing mark +
+    # color (or a plain "open" when there are no checks yet).
+    check = _PR_CHECK_STYLE.get(pr_info.get("checks"))
+    if check is None:
+        return f"{g['pr_open']} PR #{number} open", "class:card.pr.open"
+    glyph_key, word, style = check
+    return f"{g['pr_open']} PR #{number} {g[glyph_key]} {word}", style
+
+
+def _card_lines(
+    card: dict, width: int, theme: "CardTheme | None" = None
+) -> list[list[tuple[str, str]]]:
+    """Render one session card as a list of rows (each a list of style segments).
+
+    Pure and selection-agnostic: :func:`_render_cards` applies the selection
+    highlight afterward. ``width`` is the full terminal width; the card fills it
+    (minus the selection gutter) up to :data:`_CARD_MAX_WIDTH`.
+    """
+    theme = theme or _DEFAULT_THEME
+    g = theme.glyphs
+    # Leave a right margin so a glyph a terminal happens to render wider than one
+    # cell (some phone fonts do) eats slack instead of clipping the card content.
+    card_width = max(min(width - _CARD_GUTTER - _CARD_RIGHT_MARGIN, _CARD_MAX_WIDTH), 24)
+    inner = card_width - _CARD_CHROME
+    border = "class:card.border"
+
+    def content_row(segments: list[tuple[str, str]]) -> list[tuple[str, str]]:
+        visible = sum(len(text) for _style, text in segments)
+        pad = " " * max(0, inner - visible)
+        return [(border, "│ "), *segments, ("", pad), (border, " │")]
+
+    rows: list[list[tuple[str, str]]] = [[(border, "╭" + "─" * (card_width - 2) + "╮")]]
+
+    dot_style = "class:card.dot.run" if card["running"] else "class:card.dot.idle"
+    dot = g["running"] if card["running"] else g["idle"]
+    summary_lines = textwrap.wrap(card["summary"] or "", inner - 2) or ["(no summary yet)"]
+    for i, line in enumerate(summary_lines):
+        prefix = [(dot_style, f"{dot} ")] if i == 0 else [("", "  ")]
+        rows.append(content_row([*prefix, ("class:card.title", line)]))
+
+    if card["branch"]:
+        # branch [dirty] <separator> folder. No leading glyph: an uncommon symbol
+        # like ⎇ renders wide on some fonts and clips the branch name.
+        location = [("class:card.branch", card["branch"])]
+        if card.get("dirty"):
+            location.append(("class:card.dirty", g["dirty"]))
+        location.append(("class:card.folder", f"{g['separator']}{card['folder']}"))
+    else:  # chat sessions have no git branch — just show the folder
+        location = [("class:card.folder", card["folder"])]
+    rows.append(content_row(location))
+
+    pr_text, pr_style = _pr_segment(card, theme)
+    when = card["when"]
+    # Right-align the timestamp, but keep _CARD_TEXT_SLACK cells of cushion before
+    # the border. A glyph the terminal renders wider than we measured (some phone
+    # fonts substitute a wide emoji for an uncommon symbol) then eats that slack
+    # instead of clipping the PR text. Truncate only if genuinely too long.
+    usable = inner - _CARD_TEXT_SLACK
+    gap = usable - len(pr_text) - len(when)
+    if gap < 1:
+        pr_text = pr_text[: max(0, usable - len(when) - 2)] + "…"
+        gap = usable - len(pr_text) - len(when)
+    rows.append(
+        content_row(
+            [(pr_style, pr_text), ("", " " * max(1, gap)), ("class:card.time", when)]
+        )
+    )
+
+    rows.append([(border, "╰" + "─" * (card_width - 2) + "╯")])
+    return rows
+
+
+def _render_cards(
+    cards: list[dict], pointed_at: int, width: int, theme: "CardTheme | None" = None
+) -> list[tuple[str, str]]:
+    """Build the full formatted-text token stream for every card.
+
+    The card at ``pointed_at`` gets a left selection bar and the ``card.sel``
+    background layered onto *every* segment of every row — including the padding
+    and the gutter — so the whole card is washed evenly rather than only where
+    there is text. The cursor sentinel is placed on the card's middle row so
+    prompt_toolkit's scrolling keeps the entire card on screen (see
+    :func:`_pick_session`).
+    """
+    theme = theme or _DEFAULT_THEME
+    pointer, bar = theme.glyphs["select_pointer"], theme.glyphs["select_bar"]
+    tokens: list[tuple[str, str]] = []
+    for index, card in enumerate(cards):
+        selected = index == pointed_at
+        rows = _card_lines(card, width, theme)
+        cursor_row = len(rows) // 2
+        for row_number, row in enumerate(rows):
+            if selected and row_number == cursor_row:
+                tokens.append(("[SetCursorPosition]", ""))
+            gutter = (f"{pointer} " if row_number == 0 else f"{bar} ") if selected else "  "
+            tokens.append((_sel("class:card.bar", selected), gutter))
+            for style, text in row:
+                tokens.append((_sel(style, selected), text))
+            tokens.append(("", "\n"))
+    return tokens
+
+
+def _sel(style: str, selected: bool) -> str:
+    """Layer the selection background onto ``style`` when the card is selected.
+
+    Applies to empty styles too (``"" -> "class:card.sel"``) so the padding
+    between text and border is washed like everything else — otherwise short
+    lines leave dark gaps in the highlight.
+    """
+    if not selected:
+        return style
+    return f"{style} class:card.sel".strip()
+
+
+def _card_style(theme: "CardTheme | None" = None):
+    """Build the prompt_toolkit style for session cards from the theme's colors.
+
+    Each color is a prompt_toolkit style string; a bare color name is a
+    foreground, ``bg:…`` a background (lazy import). A malformed value from the
+    config would raise here, so we fall back to the defaults on any error rather
+    than break the menu.
+    """
+    from prompt_toolkit.styles import Style
+
+    c = (theme or _DEFAULT_THEME).colors
+    rules = [
+        ("card.border", c["border"]),
+        ("card.bar", c["bar"]),
+        ("card.dot.run", c["running"]),
+        ("card.dot.idle", c["idle"]),
+        ("card.title", c["title"]),
+        ("card.branch", c["branch"]),
+        ("card.dirty", c["dirty"]),
+        ("card.folder", c["folder"]),
+        ("card.pr.pass", c["pr_pass"]),
+        ("card.pr.fail", c["pr_fail"]),
+        ("card.pr.pending", c["pr_pending"]),
+        ("card.pr.open", c["pr_open"]),
+        ("card.pr.draft", c["pr_draft"]),
+        ("card.pr.merged", c["pr_merged"]),
+        ("card.pr.closed", c["pr_closed"]),
+        ("card.pr.none", c["pr_none"]),
+        ("card.time", c["time"]),
+        ("card.sel", c["selection"]),
+    ]
+    return Style(rules)
+
+
+def _pick_session(
+    message: str,
+    choices: list,
+    cards: list[dict],
+    pr_snapshot: "pr.Snapshot | None" = None,
+    card_by_key: dict | None = None,
+    theme: "CardTheme | None" = None,
+) -> tuple[str, object]:
+    """Show the session list as cards; return ``(action, value)`` like :func:`_pick_with_delete`.
+
+    Reuses questionary's ``select`` (navigation, Enter, and our ``x``-to-delete
+    binding) but replaces the per-choice renderer with :func:`_render_cards` so
+    each row is a bordered, colored card whose selected one is highlighted. The
+    render function is swapped onto the control (``control.text``), which
+    prompt_toolkit re-invokes on every keystroke, so it always reflects the live
+    ``pointed_at``.
+
+    When a :class:`pr.Snapshot` is given, its background refresh runs while the
+    menu is open: as each session's live PR status lands, the matching card's
+    ``pr`` is updated and the app is repainted (``app.invalidate()`` is thread
+    safe). The menu stays fully responsive throughout; a ``stop`` event ends the
+    refresh callbacks the moment the user leaves the view.
+    """
+    from questionary.prompts.common import InquirerControl
+
+    theme = theme or _DEFAULT_THEME
+    question = questionary.select(
+        message, choices=choices, style=_card_style(theme), pointer=None, instruction=" "
+    )
+    control = next(
+        c
+        for c in question.application.layout.find_all_controls()
+        if isinstance(c, InquirerControl)
+    )
+    width = shutil.get_terminal_size().columns
+    control.text = lambda: _render_cards(cards, control.pointed_at, width, theme)
+    _keep_card_visible(question, cards, width)
+
+    @question.application.key_bindings.add("x", eager=True)
+    def _request_delete(event) -> None:
+        event.app.exit(result=(_DELETE, control.get_pointed_at().value))
+
+    stop = threading.Event()
+    if pr_snapshot is not None and card_by_key is not None:
+        app = question.application
+
+        def _on_pr(key, pr_info) -> None:
+            card = card_by_key.get(key)
+            if card is None or stop.is_set():
+                return
+            card["pr"] = pr_info
+            card["pr_pending"] = False
+            app.invalidate()  # thread-safe repaint; no-ops if the app has closed
+
+        pr_snapshot.refresh(_on_pr, stop=stop)
+
+    try:
+        answer = question.ask()
+    finally:
+        stop.set()  # stop enriching cards once we leave the view
+
+    if answer is None:
+        return "cancel", None
+    if isinstance(answer, tuple) and answer[0] is _DELETE:
+        return "delete", answer[1]
+    return "select", answer
+
+
+def _keep_card_visible(question: "questionary.Question", cards: list[dict], width: int) -> None:
+    """Scroll the whole selected card into view, not just its cursor line.
+
+    The cursor sentinel sits on each card's middle row (see :func:`_render_cards`);
+    setting the choices window's ``scroll_offsets`` to half the tallest card keeps
+    that many lines visible above and below the cursor, so the full card — top
+    border to bottom — stays on screen instead of running off the bottom. Purely
+    cosmetic; any prompt_toolkit internals change is swallowed.
+    """
+    from prompt_toolkit.layout.containers import ScrollOffsets
+
+    try:
+        tallest = max((len(_card_lines(card, width)) for card in cards), default=1)
+        pad = tallest // 2 + 1
+        for container in question.application.layout.walk():
+            content = getattr(container, "content", None)
+            if type(content).__name__ == "InquirerControl":
+                container.scroll_offsets = ScrollOffsets(top=pad, bottom=pad)
+                return
+    except Exception:  # noqa: BLE001 — cosmetic only, never block the prompt
+        pass
 
 
 def _wrap_choice_lines(question: "questionary.Question") -> None:
@@ -732,10 +1119,10 @@ def _interactive_menu(default_agent: str, bypass: bool) -> None:
     """Top-level menu shown when vv is invoked with no arguments."""
     _banner()
     actions = {
-        "⊞  List existing sessions": _menu_list_sessions,
-        "✦  Start a new session from an existing repo": _menu_new_from_repo,
-        "⊕  Add a new repo": _menu_add_repo,
-        "✎  Start a chat-only session (no repo)": _menu_new_chat,
+        "●  List existing sessions": _menu_list_sessions,
+        "➥  Start a new session from an existing repo": _menu_new_from_repo,
+        "✚  Add a new repo": _menu_add_repo,
+        "❝  Start a chat-only session (no repo)": _menu_new_chat,
     }
     choice = questionary.select("What would you like to do?", choices=list(actions)).ask()
     if choice is None:

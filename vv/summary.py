@@ -589,9 +589,13 @@ def _content_text(content: object) -> str:
 
 
 def _first_line(text: str) -> str | None:
-    """Return the first non-blank line of ``text``, stripped, or ``None``."""
+    """Return the first non-blank line of ``text``, cleaned, or ``None``.
+
+    Strips leading list/quote punctuation an agent sometimes prefixes (``- ``,
+    ``: ``, ``• ``, ``> ``…) so the summary starts on a real word.
+    """
     for line in text.splitlines():
-        line = line.strip()
+        line = line.strip().lstrip("-:•*>–— ").strip()
         if line:
             return line
     return None

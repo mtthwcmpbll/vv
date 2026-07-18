@@ -174,6 +174,14 @@ def current_branch(worktree_path: Path) -> str:
     )
 
 
+def head_commit(worktree_path: Path) -> str:
+    """Return the full SHA of the worktree's HEAD commit."""
+    return _run(
+        ["git", "-C", str(worktree_path), "rev-parse", "HEAD"],
+        capture=True,
+    )
+
+
 def log_oneline(worktree_path: Path, *, limit: int = 20, unpushed_only: bool = False) -> str:
     """Return up to ``limit`` recent commits, one ``<sha> <subject>`` per line.
 

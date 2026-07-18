@@ -10,8 +10,13 @@ rather than aborting — hence these helpers swallow failures instead of raising
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
+from pathlib import Path
+
+#: How long to wait for a single ``gh pr view`` before giving up on it.
+PR_TIMEOUT_SECONDS = 6.0
 
 
 def is_available() -> bool:
@@ -62,6 +67,74 @@ def list_repos() -> list[str]:
         return []
     names = {line.strip() for line in result.stdout.splitlines() if line.strip()}
     return sorted(names)
+
+
+def pr_status(worktree_path: Path) -> dict | None:
+    """Return the pull-request status for the branch checked out in a worktree.
+
+    Runs ``gh pr view`` inside ``worktree_path`` and normalizes the result to
+    ``{"number": int, "state": "open"|"merged"|"closed", "checks":
+    "passing"|"failing"|"pending"|None}``. Returns ``None`` when there is no PR
+    for the branch, the directory is not a GitHub repo, or ``gh`` is missing /
+    fails — in the never-raise spirit of this module, so callers can just show
+    "no PR".
+    """
+    try:
+        result = subprocess.run(
+            [
+                "gh", "pr", "view",
+                "--json", "number,state,isDraft,statusCheckRollup",
+            ],
+            cwd=str(worktree_path),
+            capture_output=True,
+            text=True,
+            timeout=PR_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None  # no PR for this branch, or not a GitHub repo
+    try:
+        data = json.loads(result.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("number") is None:
+        return None
+    # `state` is OPEN/MERGED/CLOSED; a draft is an open PR with isDraft set, so
+    # promote it to its own "draft" state for the caller.
+    state = str(data.get("state", "")).lower() or "open"
+    if state == "open" and data.get("isDraft"):
+        state = "draft"
+    return {
+        "number": data.get("number"),
+        "state": state,
+        "checks": _rollup_state(data.get("statusCheckRollup")),
+    }
+
+
+def _rollup_state(rollup: object) -> str | None:
+    """Collapse a ``statusCheckRollup`` list into passing/failing/pending/None.
+
+    Handles both check-run entries (``status`` + ``conclusion``) and legacy
+    status contexts (``state``). Failing wins over pending wins over passing; a
+    PR with no checks at all yields ``None``.
+    """
+    if not isinstance(rollup, list) or not rollup:
+        return None
+    failing = {"FAILURE", "ERROR", "TIMED_OUT", "ACTION_REQUIRED", "CANCELLED"}
+    pending = {"QUEUED", "IN_PROGRESS", "PENDING", "WAITING", "EXPECTED", "REQUESTED"}
+    saw_pending = False
+    for check in rollup:
+        if not isinstance(check, dict):
+            continue
+        # Check runs report a terminal `conclusion` only once `status` completes;
+        # status contexts carry a single `state`.
+        signal = (check.get("conclusion") or check.get("status") or check.get("state") or "").upper()
+        if signal in failing:
+            return "failing"
+        if signal in pending:
+            saw_pending = True
+    return "pending" if saw_pending else "passing"
 
 
 def clone_url(name_with_owner: str, protocol: str = "ssh") -> str:

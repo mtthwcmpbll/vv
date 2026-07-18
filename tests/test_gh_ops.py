@@ -84,3 +84,63 @@ def test_clone_url_ssh_explicit():
 
 def test_clone_url_https():
     assert gh_ops.clone_url("octo/repo", "https") == "https://github.com/octo/repo.git"
+
+
+# --- pr_status --------------------------------------------------------------
+
+import json
+from pathlib import Path
+
+
+def _pr_json(number, state, checks, is_draft=False):
+    rollup = {
+        "passing": [{"conclusion": "SUCCESS"}],
+        "failing": [{"conclusion": "SUCCESS"}, {"conclusion": "FAILURE"}],
+        "pending": [{"status": "IN_PROGRESS"}],
+        None: [],
+    }[checks]
+    return json.dumps(
+        {"number": number, "state": state, "isDraft": is_draft, "statusCheckRollup": rollup}
+    )
+
+
+def test_pr_status_parses_open_failing(monkeypatch):
+    _stub_run(monkeypatch, _completed(0, _pr_json(3, "OPEN", "failing")))
+    assert gh_ops.pr_status(Path("/wt")) == {"number": 3, "state": "open", "checks": "failing"}
+
+
+def test_pr_status_parses_passing_and_pending(monkeypatch):
+    _stub_run(monkeypatch, _completed(0, _pr_json(5, "OPEN", "passing")))
+    assert gh_ops.pr_status(Path("/wt"))["checks"] == "passing"
+    _stub_run(monkeypatch, _completed(0, _pr_json(6, "OPEN", "pending")))
+    assert gh_ops.pr_status(Path("/wt"))["checks"] == "pending"
+
+
+def test_pr_status_no_checks_is_none(monkeypatch):
+    _stub_run(monkeypatch, _completed(0, _pr_json(7, "MERGED", None)))
+    assert gh_ops.pr_status(Path("/wt")) == {"number": 7, "state": "merged", "checks": None}
+
+
+def test_pr_status_promotes_draft(monkeypatch):
+    _stub_run(monkeypatch, _completed(0, _pr_json(9, "OPEN", None, is_draft=True)))
+    assert gh_ops.pr_status(Path("/wt"))["state"] == "draft"
+
+
+def test_pr_status_open_not_draft(monkeypatch):
+    _stub_run(monkeypatch, _completed(0, _pr_json(9, "OPEN", "passing", is_draft=False)))
+    assert gh_ops.pr_status(Path("/wt"))["state"] == "open"
+
+
+def test_pr_status_none_when_no_pr(monkeypatch):
+    _stub_run(monkeypatch, _completed(returncode=1))  # gh: no pull requests found
+    assert gh_ops.pr_status(Path("/wt")) is None
+
+
+def test_pr_status_none_when_gh_missing(monkeypatch):
+    _stub_run(monkeypatch, FileNotFoundError())
+    assert gh_ops.pr_status(Path("/wt")) is None
+
+
+def test_pr_status_none_on_timeout(monkeypatch):
+    _stub_run(monkeypatch, subprocess.TimeoutExpired(["gh"], 6))
+    assert gh_ops.pr_status(Path("/wt")) is None

@@ -107,15 +107,46 @@ only sessions that have actually changed since last time — been opened and wor
 in — are regenerated; the rest are served from cache. The cache is rewritten to
 exactly the current sessions each open (pruning deleted ones), and entries also
 carry the `agent` they were generated with so switching `summary_agent`
-invalidates them. `_session_title()`
-lays each choice out as a header line (`● repo/name [created]`) with the summary
-on the line(s) below, **manually** wrapped (via `textwrap`) to the terminal width
-and prefixed with `_SUMMARY_INDENT` (8) spaces on *every* wrapped line — so the
-whole summary block stays indented under the name and readable on a narrow mobile
-terminal. `_pick_with_delete()` also calls `_wrap_choice_lines()` to flip the
-questionary choices window to `wrap_lines=True` as a truncation fallback (its
-continuation lines restart at column 0, which is why the summary is pre-wrapped
-rather than relying on it). Summaries come from `summary.summarize_all()`, which runs the
+invalidates them.
+
+Each session is drawn as a **cmux-style card** (a bordered rectangle) rather than
+a flat row: `_card_lines()` renders the summary/title (with a `●` running / `○`
+idle dot), then a `branch [*] · repo/name` line (the `*`, from `_worktree_dirty()`,
+flags uncommitted/unpushed work; no leading glyph — an uncommon symbol like `⎇`
+renders wide on some phone fonts and clips the branch name), then a color-coded
+PR-status line with a right-aligned relative timestamp (`_relative_time()`). Cards
+also leave `_CARD_RIGHT_MARGIN` + `_CARD_TEXT_SLACK` of slack (outside the card,
+and before the right-aligned timestamp) so a glyph a terminal renders wider than
+measured can't clip content. `_pr_segment()` encodes PR **state** with a default
+plain-Unicode circle family (`◌` draft / `○` open / `●` merged) plus `⊘` closed;
+for an open PR the check rollup adds a `✓`/`✗`/`◔` mark and drives the color
+(green/red/yellow), else cyan for a checkless open PR. Non-git sessions show
+`❝ chat session`, git sessions with no PR `○ no open PR`. All glyphs are themeable
+(see below) and default to plain Unicode (not Nerd Font octicons) so they render
+on a mobile terminal without the patched font. Draft state comes from `gh`'s
+`isDraft` (see `gh_ops.pr_status`). `_pick_session()`
+reuses questionary's `select` (navigation, Enter, and the `x`-to-delete binding)
+but **swaps out the per-choice renderer**: it sets `control.text` to
+`_render_cards()`, which prompt_toolkit re-invokes each keystroke, so the card at
+`control.pointed_at` gets a left selection bar (`▌`) and a `card.sel` background
+wash layered onto every segment — full color *and* whole-card highlight, which
+questionary's built-in string/`class:highlighted` rendering can't do together.
+Every card **glyph and color is themeable from config**: `_DEFAULT_GLYPHS` /
+`_DEFAULT_COLORS` hold the defaults, `_card_theme()` layers the config's
+`[cards.glyphs]` / `[cards.colors]` tables (`config.configured_card_glyphs()` /
+`configured_card_colors()`) over them into a `CardTheme` that threads through
+`_card_lines` / `_pr_segment` / `_render_cards` / `_card_style` (each defaults to
+`_DEFAULT_THEME` so tests and callers can omit it). Colors are prompt_toolkit
+style strings; `_valid_colors()` probes each override and drops any prompt_toolkit
+can't parse, so a config typo can't crash the menu at render. Styling is a
+`_card_style()` prompt_toolkit `Style` passed to `select`. PR status
+loads **non-blocking**: `pr.Snapshot` serves whatever is cached instantly (a
+stale git session shows `⋯ checking…`), and `_pick_session` kicks off its
+background `refresh()` while the menu runs — as each session's live status lands,
+the matching card's `pr` is updated and `app.invalidate()` repaints (thread-safe),
+so the view enriches after a beat without ever blocking input. A `threading.Event`
+stops the callbacks the moment the user leaves the view. Summaries come from
+`summary.summarize_all()`, which runs the
 configured **summary agent** (`config.configured_summary_agent()`, falling back
 to the session agent) in non-interactive "print" mode over each session in
 parallel. The context it feeds that agent (`summary._gather_context()`) blends
@@ -205,10 +236,12 @@ is verified; the others in `BYPASS_FLAGS` are best-guesses.
 
 - `config.py` — resolves `WORKSPACES_DIR` / `WORKTREES_DIR` and the `VV_CONFIG`
   TOML file (all env-overridable; default under `~/.vv/`). Also exposes
-  `chats_dir()` (= `WORKTREES_DIR/_chats`) for chat-only sessions and
-  `summary_cache_file()` (= `WORKTREES_DIR/.summaries.json`) for the summary cache. Parses the
+  `chats_dir()` (= `WORKTREES_DIR/_chats`) for chat-only sessions,
+  `summary_cache_file()` (= `WORKTREES_DIR/.summaries.json`) for the summary
+  cache, and `pr_cache_file()` (= `WORKTREES_DIR/.pr-status.json`) for the PR cache. Parses the
   config file (`configured_agent()`, `configured_summary_agent()`,
-  `configured_ask()`, `configured_mode()`,
+  `configured_card_glyphs()` / `configured_card_colors()` (the `[cards.*]`
+  session-card theme), `configured_ask()`, `configured_mode()`,
   `configured_clone_protocol()` → `ssh`/`https`, `configured_remote()` → the
   `Remote` dataclass); raises `ConfigError` on malformed TOML or a
   half-configured `[remote]`.
@@ -251,9 +284,20 @@ is verified; the others in `BYPASS_FLAGS` are best-guesses.
   API, paginated and `gh`-cached for an hour — spans org repos, not just the
   user's own), and `clone_url()` (maps a picked `owner/name` to a github.com
   URL in the caller-supplied protocol — SSH `git@github.com:…` by default, else
-  HTTPS; resolved from `config.configured_clone_protocol()`). Unlike the other
-  ops modules it **never raises** — every failure degrades to `[]` so the menu
-  falls back to manual URL entry.
+  HTTPS; resolved from `config.configured_clone_protocol()`), and `pr_status()`
+  (runs `gh pr view` in a worktree → normalized `{number, state, checks}` for the
+  session card, or `None`). Unlike the other ops modules it **never raises** —
+  every failure degrades to `[]`/`None` so the menu falls back gracefully.
+- `pr.py` — cached, background-refreshed pull-request status for the session
+  cards. `Snapshot(sessions)` exposes `.cached` (PR statuses already known, no
+  `gh` calls) and `.stale_keys` (sessions to refetch); `.refresh(on_result, stop)`
+  spawns a daemon thread that fetches the stale ones (`gh_ops.pr_status`) in
+  parallel, calls `on_result(key, pr)` as each lands, and rewrites the cache.
+  Cache is keyed by a `session_fingerprint()` of branch + HEAD commit, so a
+  session is only refetched once its branch moves (CI checks that finish without
+  a new commit lag until the next push — the deliberate trade for a fast menu).
+  Same on-disk cache shape as `summary` (version-stamped JSON, pruned to current
+  sessions each refresh).
 - `tmux_ops.py` — `tmux` CLI wrappers; raises `TmuxError`.
 - `cmux_ops.py` — `cmux` CLI wrappers for remote mode (`is_available()`,
   `new_ssh_workspace()` → opens a `cmux ssh` workspace and returns its id,

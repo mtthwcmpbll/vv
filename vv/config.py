@@ -86,6 +86,14 @@ def summary_cache_file() -> Path:
     return worktrees_dir() / ".summaries.json"
 
 
+def pr_cache_file() -> Path:
+    """Path to the JSON cache of per-session pull-request status.
+
+    Sits alongside :func:`summary_cache_file` inside :func:`worktrees_dir`.
+    """
+    return worktrees_dir() / ".pr-status.json"
+
+
 def config_file() -> Path:
     """Path to the vv TOML config file (override with ``VV_CONFIG``)."""
     raw = os.environ.get("VV_CONFIG")
@@ -130,6 +138,38 @@ def configured_summary_agent() -> str | None:
     if isinstance(value, str) and value.strip():
         return value.strip()
     return None
+
+
+def configured_card_glyphs() -> dict[str, str]:
+    """Return the user's ``[cards.glyphs]`` overrides (a ``key -> glyph`` map).
+
+    Only string values are kept; the caller merges these over its built-in
+    defaults, so unknown keys are harmless and a missing table yields ``{}``.
+    Values are taken verbatim (not stripped) — a separator glyph like `` · ``
+    is meant to carry its surrounding spaces.
+    """
+    return _card_subtable("glyphs")
+
+
+def configured_card_colors() -> dict[str, str]:
+    """Return the user's ``[cards.colors]`` overrides (a ``key -> style`` map).
+
+    Values are prompt_toolkit style strings (e.g. ``"ansigreen bold"``,
+    ``"#ff8800"``, ``"bg:#334155"``). Same lenient merge semantics as
+    :func:`configured_card_glyphs`.
+    """
+    return _card_subtable("colors")
+
+
+def _card_subtable(section: str) -> dict[str, str]:
+    """Extract ``[cards.<section>]`` as a ``str -> str`` map (empty if absent)."""
+    cards = _load_config().get("cards")
+    if not isinstance(cards, dict):
+        return {}
+    table = cards.get(section)
+    if not isinstance(table, dict):
+        return {}
+    return {key: value for key, value in table.items() if isinstance(value, str)}
 
 
 def configured_ask() -> bool:

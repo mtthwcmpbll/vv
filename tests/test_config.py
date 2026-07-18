@@ -128,6 +128,31 @@ def test_configured_summary_agent_is_none_when_not_a_string(monkeypatch, tmp_pat
     assert config.configured_summary_agent() is None
 
 
+# --- configured_card_glyphs / configured_card_colors ------------------------
+
+def test_configured_card_glyphs_empty_without_a_table(monkeypatch, tmp_path):
+    _use_config(monkeypatch, tmp_path, 'agent = "claude"\n')
+    assert config.configured_card_glyphs() == {}
+    assert config.configured_card_colors() == {}
+
+
+def test_configured_card_glyphs_reads_the_table(monkeypatch, tmp_path):
+    _use_config(monkeypatch, tmp_path, '[cards.glyphs]\nrunning = ">"\nseparator = "  ~  "\n')
+    # values are taken verbatim (separator keeps its spaces)
+    assert config.configured_card_glyphs() == {"running": ">", "separator": "  ~  "}
+
+
+def test_configured_card_colors_reads_the_table(monkeypatch, tmp_path):
+    _use_config(monkeypatch, tmp_path, '[cards.colors]\nbranch = "#ff8800"\nbad = 5\n')
+    # non-string values are dropped
+    assert config.configured_card_colors() == {"branch": "#ff8800"}
+
+
+def test_configured_cards_ignores_non_table(monkeypatch, tmp_path):
+    _use_config(monkeypatch, tmp_path, 'cards = "nope"\n')
+    assert config.configured_card_glyphs() == {}
+
+
 # --- configured_ask ---------------------------------------------------------
 
 def test_configured_ask_is_false_without_a_file(monkeypatch, tmp_path):

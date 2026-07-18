@@ -751,38 +751,168 @@ def test_session_summaries_prunes_deleted_sessions_from_cache(monkeypatch, tmp_p
     assert set(written) == {"r/a"}
 
 
-# --- session menu titles / line wrapping ------------------------------------
+# --- session cards ----------------------------------------------------------
 
-def test_session_title_puts_summary_on_an_indented_second_line():
-    title = cli._session_title(
-        "○", "repo/breezy", "07/15/2026 1:34pm", "Refactoring auth flow", width=80
+def _plain(rows):
+    """Flatten card rows to plain lines (dropping styles) for assertions."""
+    return ["".join(text for _style, text in row) for row in rows]
+
+
+def _git_card(**over):
+    card = {
+        "running": False, "summary": "Refactoring the auth flow",
+        "branch": "breezy", "folder": "repo/breezy", "pr": None, "when": "2h ago",
+    }
+    card.update(over)
+    return card
+
+
+def test_card_lines_layout_and_uniform_width():
+    rows = _plain(cli._card_lines(_git_card(), width=54))
+    # bordered box: top, summary, branch/folder, pr, bottom
+    assert rows[0].startswith("╭") and rows[0].endswith("╮")
+    assert rows[-1].startswith("╰") and rows[-1].endswith("╯")
+    assert all(len(r) == len(rows[0]) for r in rows)          # every row same width
+    assert "▸ " not in rows[1] and "▹ Refactoring the auth flow" in rows[1]  # idle triangle
+    # branch reads fully (no leading glyph to clip it), then " · " then the folder
+    assert "breezy · repo/breezy" in rows[2]
+    assert "⎇" not in rows[2]
+    assert "2h ago" in rows[3]                                 # timestamp right-aligned
+
+
+def test_card_lines_branch_shows_dirty_asterisk():
+    clean = _plain(cli._card_lines(_git_card(dirty=False), width=54))[2]
+    dirty = _plain(cli._card_lines(_git_card(dirty=True), width=54))[2]
+    assert "breezy · repo/breezy" in clean and "breezy✱" not in clean
+    assert "breezy✱ · repo/breezy" in dirty  # ✱ sits between branch and separator
+
+
+def test_card_lines_running_dot_and_chat_without_branch():
+    running = _plain(cli._card_lines(_git_card(running=True), width=54))
+    assert "▸ Refactoring the auth flow" in running[1]          # filled triangle when live
+
+    chat = _plain(cli._card_lines(
+        _git_card(branch=None, folder="_chats/spark", summary="Scratch space"), width=54
+    ))
+    assert "_chats/spark" in chat[2]                            # chats: just the folder
+    assert "chat session" in chat[3]
+
+
+def test_card_pr_segment_states():
+    # Open PR: outline circle + check mark, colored by the check rollup.
+    assert cli._pr_segment(_git_card(pr={"number": 3, "state": "open", "checks": "failing"})) \
+        == ("○ PR #3 ✗ failing", "class:card.pr.fail")
+    assert cli._pr_segment(_git_card(pr={"number": 5, "state": "open", "checks": "passing"})) \
+        == ("○ PR #5 ✓ passing", "class:card.pr.pass")
+    assert cli._pr_segment(_git_card(pr={"number": 8, "state": "open", "checks": "pending"})) \
+        == ("○ PR #8 ◔ pending", "class:card.pr.pending")
+    assert cli._pr_segment(_git_card(pr={"number": 9, "state": "open", "checks": None})) \
+        == ("○ PR #9 open", "class:card.pr.open")
+    # Draft / merged / closed: their own circle-family glyph, no check overlay.
+    assert cli._pr_segment(_git_card(pr={"number": 7, "state": "draft"})) \
+        == ("◌ PR #7 draft", "class:card.pr.draft")
+    assert cli._pr_segment(_git_card(pr={"number": 2, "state": "merged"})) \
+        == ("● PR #2 merged", "class:card.pr.merged")
+    assert cli._pr_segment(_git_card(pr={"number": 4, "state": "closed"})) \
+        == ("⊘ PR #4 closed", "class:card.pr.closed")
+    assert cli._pr_segment(_git_card(pr=None))[0] == "○ no open PR"
+    assert cli._pr_segment(_git_card(branch=None))[0] == "❝ chat session"
+
+
+def test_pr_segment_shows_checking_while_refresh_pending():
+    # A git session whose PR status hasn't been fetched yet shows a placeholder,
+    # not "no open PR" (which would be wrong until the background fetch lands).
+    assert cli._pr_segment(_git_card(pr=None, pr_pending=True))[0] == "⋯ checking…"
+    # Once the fetch lands with no PR, it settles to the real answer.
+    assert cli._pr_segment(_git_card(pr=None, pr_pending=False))[0] == "○ no open PR"
+
+
+def test_render_cards_marks_only_the_selected_card():
+    cards = [_git_card(folder="r/a"), _git_card(folder="r/b")]
+    tokens = cli._render_cards(cards, pointed_at=1, width=54)
+    text = "".join(t for _s, t in tokens)
+    assert "❯ " in text and "▌ " in text                        # selection bar present
+    # the SetCursorPosition sentinel is emitted once, for the selected card
+    assert [s for s, _t in tokens].count("[SetCursorPosition]") == 1
+
+
+def test_selected_card_has_no_unwashed_gaps():
+    # Render ONLY the selected card: every visible segment (text, padding, gutter)
+    # must carry card.sel, so the highlight has no dark holes on short lines.
+    tokens = cli._render_cards([_git_card(summary="x")], pointed_at=0, width=54)
+    unwashed = [(s, t) for s, t in tokens if t not in ("", "\n") and "card.sel" not in s]
+    assert unwashed == []
+
+
+def test_unselected_card_has_no_highlight():
+    tokens = cli._render_cards([_git_card(), _git_card()], pointed_at=0, width=54)
+    # card at index 1 is not selected -> none of the "r/b"-region segments washed.
+    # Simplest: with pointed_at far out of range, nothing is washed at all.
+    none_sel = cli._render_cards([_git_card()], pointed_at=99, width=54)
+    assert all("card.sel" not in s for s, _t in none_sel)
+
+
+def test_keep_card_visible_sets_scroll_offsets():
+    import questionary
+    from prompt_toolkit.layout.containers import ScrollOffsets
+
+    cards = [_git_card(summary="a\nb\nc"), _git_card()]
+    choices = [questionary.Choice(title="a", value=1), questionary.Choice(title="b", value=2)]
+    q = questionary.select("m", choices=choices)
+    cli._keep_card_visible(q, cards, width=54)
+
+    def choice_window():
+        for c in q.application.layout.walk():
+            if type(getattr(c, "content", None)).__name__ == "InquirerControl":
+                return c
+        return None
+
+    off = choice_window().scroll_offsets
+    assert isinstance(off, ScrollOffsets)
+    assert off.top > 0 and off.bottom > 0     # a margin is reserved on both sides
+
+
+def test_card_theme_merges_config_over_defaults(monkeypatch):
+    from vv import config
+
+    monkeypatch.setattr(config, "configured_card_glyphs", lambda: {"running": ">", "chat": "🗨"})
+    monkeypatch.setattr(config, "configured_card_colors", lambda: {"branch": "#ff8800"})
+    theme = cli._card_theme()
+    assert theme.glyphs["running"] == ">"          # overridden
+    assert theme.glyphs["idle"] == cli._DEFAULT_GLYPHS["idle"]   # untouched default
+    assert theme.colors["branch"] == "#ff8800"     # overridden
+    assert theme.colors["pr_fail"] == cli._DEFAULT_COLORS["pr_fail"]
+
+
+def test_card_theme_drops_malformed_colors(monkeypatch):
+    from vv import config
+
+    monkeypatch.setattr(config, "configured_card_glyphs", lambda: {})
+    monkeypatch.setattr(config, "configured_card_colors", lambda: {"branch": "notacolor"})
+    # a color prompt_toolkit can't parse is dropped, keeping the default (so the
+    # menu can't crash at render time on a config typo)
+    assert cli._card_theme().colors["branch"] == cli._DEFAULT_COLORS["branch"]
+
+
+def test_render_honors_theme_glyph_overrides():
+    theme = cli.CardTheme(
+        glyphs={**cli._DEFAULT_GLYPHS, "running": "»", "check_failing": "X", "select_pointer": "="},
+        colors=cli._DEFAULT_COLORS,
     )
-    line1, line2 = title.split("\n")
-    assert line1 == "○  repo/breezy  [07/15/2026 1:34pm]"
-    assert line2 == "        Refactoring auth flow"  # 8-space indent, ~under the name
+    card = _git_card(running=True, pr={"number": 3, "state": "open", "checks": "failing"})
+    text = "".join(t for _s, t in cli._render_cards([card], pointed_at=0, width=54, theme=theme))
+    assert "» " in text and "X failing" in text and "= " in text  # all three overrides applied
+    assert "▸ " not in text and "❯ " not in text                  # defaults replaced
 
 
-def test_session_title_wraps_long_summary_keeping_every_line_indented():
-    summary = (
-        "Diagnose starship prompt sharp end-caps as missing Nerd Font on phone "
-        "and figure out the right fallback glyphs to ship"
-    )
-    title = cli._session_title("○", "_chats/fjord", "07/11/2026 9:50pm", summary, width=40)
-    header, *summary_lines = title.split("\n")
-    assert header == "○  _chats/fjord  [07/11/2026 9:50pm]"
-    assert len(summary_lines) > 1  # it actually wrapped
-    for line in summary_lines:
-        assert line.startswith(" " * 8)          # every wrapped line indented the same
-        assert line[8] != " "                    # indent is exactly 8, content follows
-        assert len(line) <= 40                    # never exceeds the terminal width
-    # the wrapped text reconstructs the original summary
-    assert " ".join(line.strip() for line in summary_lines) == summary
-
-
-def test_session_title_is_single_line_without_a_summary():
-    title = cli._session_title("●", "repo/breezy", "07/15/2026 1:34pm", None)
-    assert "\n" not in title
-    assert title == "●  repo/breezy  [07/15/2026 1:34pm]"
+def test_relative_time_buckets(monkeypatch):
+    import time as _time
+    monkeypatch.setattr(_time, "time", lambda: 1_000_000.0)
+    assert cli._relative_time(1_000_000.0 - 30) == "just now"
+    assert cli._relative_time(1_000_000.0 - 5 * 60) == "5m ago"
+    assert cli._relative_time(1_000_000.0 - 3 * 3600) == "3h ago"
+    assert cli._relative_time(1_000_000.0 - 2 * 86400) == "2d ago"
+    assert cli._relative_time(1_000_000.0 - 3 * 604800) == "3w ago"
 
 
 def test_wrap_choice_lines_enables_wrapping_on_the_choices_window():
