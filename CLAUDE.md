@@ -61,6 +61,10 @@ Four flows, all ending in `_resume_worktree()`:
   repo (pick from your GitHub repos via `gh`, or paste a URL), or start a
   chat-only session.
 
+A fifth flow starts no session at all: **`vv --title TEXT`** (`-t`) /
+**`vv --label TAG`** (`-l`) → `cli._apply_notes()` annotates an *existing*
+session and exits (see "Session notes" below).
+
 `_menu_add_repo()` shows a scrollable `questionary.select` of every GitHub repo
 the user can access (`_pick_github_repo()`) when `gh_ops.is_available()` (gh on PATH
 and logged in). Typing filters the `owner/name` list by **substring**
@@ -110,8 +114,14 @@ carry the `agent` they were generated with so switching `summary_agent`
 invalidates them.
 
 Each session is drawn as a **cmux-style card** (a bordered rectangle) rather than
-a flat row: `_card_lines()` renders the summary/title (with a `●` running / `○`
-idle dot), then a `branch [*] · repo/name` line (the `*`, from `_worktree_dirty()`,
+a flat row: `_card_lines()` renders a **headline** (with a `●` running / `○` idle
+dot) — the user's own `--title` when they set one, else the generated summary. A
+title does not *replace* the summary: it displaces it to the row below, indented
+and in the quieter `card.summary` style, so a card can carry both. Then — when
+the session has any — a row of `#label` chips indented the same way (both from
+`notes.all_notes()`; chips are joined by the `label_gap` glyph and wrapped like
+the headline, and each row is omitted entirely when empty), then a
+`branch [*] · repo/name` line (the `*`, from `_worktree_dirty()`,
 flags uncommitted/unpushed work; no leading glyph — an uncommon symbol like `⎇`
 renders wide on some phone fonts and clips the branch name), then a color-coded
 PR-status line with a right-aligned relative timestamp (`_relative_time()`). Cards
@@ -166,6 +176,56 @@ session and runs `git_ops.remove_worktree(force=True)` +
 `git_ops.delete_branch(force=True)` — so a deleted worktree frees its name for
 reuse. Chat sessions branch through `_delete_chat()` instead: no git ops, but
 the user is still warned if the directory is non-empty before `shutil.rmtree`.
+Both deletions (and `_delete_repo()`, via `notes.forget_repo()`) call
+`notes.forget()` so a deleted session's notes don't linger in the store.
+
+### Session notes (title + labels)
+
+The two **manual** levers for telling many sessions apart, deliberately kept in
+one store and one flow because they behave identically:
+
+- `vv --title TEXT` / `-t TEXT` sets a one-line title the user writes; a blank
+  title (`vv -t ""`) clears it.
+- `vv --label TAG` / `-l TAG` attaches a free-text label; `--label=-TAG` removes
+  it. The flag is **repeatable** and specs are applied in order.
+
+Both take the same two shapes, and can be combined in one invocation:
+
+- **On their own** (`vv -t "Acme" -l urgent`) → `cli._apply_notes()` annotates an
+  existing session and exits without starting anything. The target is
+  `--name NAME` if given, else the session the **cwd** is inside
+  (`_session_from_cwd()` matches the cwd or any subdirectory of it against
+  `_list_worktrees()`) — so inside a session you can just annotate it. Neither
+  resolving? A hard error, since silently annotating the wrong session would be
+  worse.
+- **Alongside a create flow** (`vv <url> -t "Acme"`, `vv --chat -l acme`) → the
+  flags are bundled into a `notes.Pending` that threads through
+  `_start_from_url` / `_new_worktree_session` / `_new_chat_session` as
+  `pending_notes` and is stamped by `_note_new_session()` once the name is
+  settled but *before* `_resume_worktree()` hands over the terminal (nothing
+  runs after the attach). A bad label spec there is a warning, not a failure —
+  the session already exists.
+
+Notes are **user data, not a cache**: `notes.py` owns a single JSON store
+(`config.notes_file()` → `WORKTREES_DIR/.session-notes.json`, same
+version-stamped shape and `"<repo>/<name>"` keys as the summary/PR caches) that
+nothing regenerates. Each entry is a `Note(title, labels)`; `set_title()` and
+`apply_labels()` each rewrite only their own half, so the two levers never
+clobber each other. `apply_labels()` parses every spec up front (`parse_spec()`,
+which rejects a bare sign) so a typo in the last spec doesn't half-apply the
+rest; matching is case-insensitive (no `Acme`/`acme` duplicates) while the
+casing the user typed is preserved, order is insertion order, and re-adding or
+removing a missing label is a no-op rather than an error. A title is collapsed
+to a single line (`clean_title()`) so a pasted paragraph can't wreck the card
+layout. Sessions left with neither a title nor labels are dropped from the store
+on write, and a falsy `Note` is how "nothing set" is tested throughout.
+
+In **remote mode** the two shapes diverge deliberately: a create flow forwards
+its flags (as `--title=<text>` / `--label=<spec>`, the `=` form so a removal's
+leading `-` — or a title starting with one — can't be read as a flag by the
+remote's parser), but annotating an existing session is handled *locally and
+never launches a cmux tab* — inside a remote session you are already running the
+remote's own vv, whose config has no `[remote]`.
 
 ### Remote-launcher mode (cmux)
 
@@ -238,7 +298,9 @@ is verified; the others in `BYPASS_FLAGS` are best-guesses.
   TOML file (all env-overridable; default under `~/.vv/`). Also exposes
   `chats_dir()` (= `WORKTREES_DIR/_chats`) for chat-only sessions,
   `summary_cache_file()` (= `WORKTREES_DIR/.summaries.json`) for the summary
-  cache, and `pr_cache_file()` (= `WORKTREES_DIR/.pr-status.json`) for the PR cache. Parses the
+  cache, `pr_cache_file()` (= `WORKTREES_DIR/.pr-status.json`) for the PR cache,
+  and `notes_file()` (= `WORKTREES_DIR/.session-notes.json`) for the user's
+  session titles/labels. Parses the
   config file (`configured_agent()`, `configured_summary_agent()`,
   `configured_card_glyphs()` / `configured_card_colors()` (the `[cards.*]`
   session-card theme), `configured_ask()`, `configured_mode()`,
@@ -248,6 +310,14 @@ is verified; the others in `BYPASS_FLAGS` are best-guesses.
 - `agents.py` — `DEFAULT_AGENT`, the `KNOWN_AGENTS` list seeding the picker,
   `PATH` detection (`installed_agents()`, `is_installed()`), and the
   `BYPASS_FLAGS` map + `with_bypass()`.
+- `notes.py` — the user-set session title and labels shown on the cards (see
+  "Session notes"). Owns the JSON store (`load()` / `save()` / `all_notes()` /
+  `for_session()` → a `Note`), the two writers (`set_title()`,
+  `apply_labels()` → `(labels, added, removed)`), their input normalizers
+  (`clean_title()`; `parse_spec()`, raising `LabelError`), the `Pending` bundle
+  the CLI threads into create flows, and cleanup on deletion (`forget()` /
+  `forget_repo()`). Reads degrade to `{}` on a corrupt or version-mismatched
+  store and skip malformed entries; writes are atomic and best-effort.
 - `summary.py` — generates the one-line session summaries shown in the "list
   existing sessions" menu. `PRINT_FLAGS` maps an agent command to the tokens
   that run it non-interactively (only `claude`'s is verified); `summarize()`

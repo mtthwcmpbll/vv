@@ -27,8 +27,8 @@ def captured(monkeypatch, tmp_path):
     monkeypatch.setattr(
         cli,
         "_start_from_url",
-        lambda url, agent, bypass, name=None: seen.update(
-            agent=agent, bypass=bypass, name=name
+        lambda url, agent, bypass, name=None, pending_notes=None: seen.update(
+            agent=agent, bypass=bypass, name=name, notes=pending_notes
         ),
     )
     monkeypatch.delenv("VV_AGENT", raising=False)
@@ -444,8 +444,8 @@ def test_chat_flag_starts_new_chat_session(monkeypatch, tmp_path):
     seen: dict = {}
     monkeypatch.setattr(
         cli, "_new_chat_session",
-        lambda agent, bypass, name=None: seen.update(
-            agent=agent, bypass=bypass, name=name
+        lambda agent, bypass, name=None, pending_notes=None: seen.update(
+            agent=agent, bypass=bypass, name=name, notes=pending_notes
         ),
     )
     monkeypatch.delenv("VV_AGENT", raising=False)
@@ -453,7 +453,9 @@ def test_chat_flag_starts_new_chat_session(monkeypatch, tmp_path):
 
     result = runner.invoke(cli.app, ["--chat", "--agent", "codex"])
     assert result.exit_code == 0, result.output
-    assert seen == {"agent": "codex", "bypass": True, "name": None}
+    assert seen == {
+        "agent": "codex", "bypass": True, "name": None, "notes": cli.notes.Pending(),
+    }
 
 
 def test_chat_flag_rejects_repo_url(monkeypatch, tmp_path):
@@ -463,11 +465,11 @@ def test_chat_flag_rejects_repo_url(monkeypatch, tmp_path):
     # Sanity: neither downstream entry point should be reached.
     monkeypatch.setattr(
         cli, "_new_chat_session",
-        lambda agent, bypass, name=None: pytest.fail("called"),
+        lambda agent, bypass, name=None, pending_notes=None: pytest.fail("called"),
     )
     monkeypatch.setattr(
         cli, "_start_from_url",
-        lambda url, agent, bypass, name=None: pytest.fail("called"),
+        lambda url, agent, bypass, name=None, pending_notes=None: pytest.fail("called"),
     )
 
     result = runner.invoke(cli.app, ["--chat", _REPO_URL])
@@ -503,7 +505,9 @@ def add_repo_harness(monkeypatch):
     seen: dict = {}
     monkeypatch.setattr(
         cli, "_start_from_url",
-        lambda url, agent, bypass, name=None: seen.update(url=url, agent=agent),
+        lambda url, agent, bypass, name=None, pending_notes=None: seen.update(
+            url=url, agent=agent
+        ),
     )
     monkeypatch.setattr(cli, "_pick_agent", lambda default: "claude")
 
@@ -685,6 +689,239 @@ def test_remote_mode_without_remote_config_errors(remote_harness):
     assert seen == {}
 
 
+# --- session notes: title + labels (`vv --title` / `vv --label`) ------------
+
+@pytest.fixture
+def notes_env(monkeypatch, tmp_path):
+    """Three fake sessions on disk with the notes store pointed at tmp_path.
+
+    Yields the worktree path of ``repo/alpha``; ``repo/bravo`` and the chat
+    ``_chats/spark`` also exist, so targeting can be told apart.
+    """
+    monkeypatch.setenv("WORKTREES_DIR", str(tmp_path / "wt"))
+    monkeypatch.setenv("WORKSPACES_DIR", str(tmp_path / "ws"))
+    monkeypatch.setenv("VV_CONFIG", str(tmp_path / "missing.toml"))
+    monkeypatch.delenv("VV_AGENT", raising=False)
+    monkeypatch.delenv("VV_REMOTE", raising=False)
+
+    sessions = [
+        ("repo", "alpha", tmp_path / "wt" / "repo" / "alpha"),
+        ("repo", "bravo", tmp_path / "wt" / "repo" / "bravo"),
+        (cli.CHATS, "spark", tmp_path / "wt" / "_chats" / "spark"),
+    ]
+    for _repo, _name, path in sessions:
+        path.mkdir(parents=True)
+    monkeypatch.setattr(cli, "_list_worktrees", lambda: sessions)
+    return sessions[0][2]
+
+
+def test_label_applies_to_the_session_the_cwd_is_inside(notes_env, monkeypatch):
+    from vv import notes
+
+    monkeypatch.chdir(notes_env)
+    result = runner.invoke(cli.app, ["--label", "acme", "-l", "urgent"])
+    assert result.exit_code == 0, result.output
+    assert notes.for_session("repo", "alpha").labels == ["acme", "urgent"]
+    assert "repo/alpha" in result.output and "acme, urgent" in result.output
+
+
+def test_title_applies_to_the_session_the_cwd_is_inside(notes_env, monkeypatch):
+    from vv import notes
+
+    monkeypatch.chdir(notes_env)
+    result = runner.invoke(cli.app, ["--title", "Acme onboarding"])
+    assert result.exit_code == 0, result.output
+    assert notes.for_session("repo", "alpha").title == "Acme onboarding"
+    assert "repo/alpha" in result.output
+
+
+def test_title_and_labels_can_be_set_in_one_go(notes_env, monkeypatch):
+    from vv import notes
+
+    monkeypatch.chdir(notes_env)
+    result = runner.invoke(cli.app, ["-t", "Acme onboarding", "-l", "acme"])
+    assert result.exit_code == 0, result.output
+    note = notes.for_session("repo", "alpha")
+    assert note.title == "Acme onboarding" and note.labels == ["acme"]
+
+
+def test_setting_a_title_leaves_labels_alone_and_vice_versa(notes_env, monkeypatch):
+    from vv import notes
+
+    monkeypatch.chdir(notes_env)
+    runner.invoke(cli.app, ["-l", "acme"])
+    runner.invoke(cli.app, ["-t", "Acme onboarding"])       # labels survive
+    assert notes.for_session("repo", "alpha").labels == ["acme"]
+    runner.invoke(cli.app, ["-l", "urgent"])                # title survives
+    note = notes.for_session("repo", "alpha")
+    assert note.title == "Acme onboarding" and note.labels == ["acme", "urgent"]
+
+
+def test_an_empty_title_clears_it(notes_env, monkeypatch):
+    from vv import notes
+
+    monkeypatch.chdir(notes_env)
+    runner.invoke(cli.app, ["-t", "Acme onboarding", "-l", "acme"])
+    result = runner.invoke(cli.app, ["--title", ""])
+    assert result.exit_code == 0, result.output
+    note = notes.for_session("repo", "alpha")
+    assert note.title is None and note.labels == ["acme"]   # labels untouched
+    assert "cleared" in result.output
+
+
+def test_notes_work_from_a_subdirectory_of_the_session(notes_env, monkeypatch):
+    from vv import notes
+
+    nested = notes_env / "src" / "deep"
+    nested.mkdir(parents=True)
+    monkeypatch.chdir(nested)
+    assert runner.invoke(cli.app, ["-l", "acme", "-t", "Deep work"]).exit_code == 0
+    note = notes.for_session("repo", "alpha")
+    assert note.labels == ["acme"] and note.title == "Deep work"
+
+
+def test_label_removes_with_a_leading_minus(notes_env, monkeypatch):
+    from vv import notes
+
+    monkeypatch.chdir(notes_env)
+    runner.invoke(cli.app, ["-l", "acme", "-l", "urgent"])
+    result = runner.invoke(cli.app, ["-l", "-urgent"])
+    assert result.exit_code == 0, result.output
+    assert notes.for_session("repo", "alpha").labels == ["acme"]
+
+
+def test_notes_can_target_another_session_by_name(notes_env, monkeypatch):
+    from vv import notes
+
+    monkeypatch.chdir(notes_env)                 # inside alpha…
+    result = runner.invoke(cli.app, ["-l", "acme", "-t", "Scratch", "--name", "spark"])
+    assert result.exit_code == 0, result.output
+    spark = notes.for_session(cli.CHATS, "spark")
+    assert spark.labels == ["acme"] and spark.title == "Scratch"   # …spark is annotated
+    assert not notes.for_session("repo", "alpha")
+
+
+def test_notes_outside_any_session_errors(notes_env, monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    for args in (["-l", "acme"], ["-t", "Acme"]):
+        result = runner.invoke(cli.app, args)
+        assert result.exit_code == 1
+        assert "not inside a vv session" in result.output
+
+
+def test_notes_with_an_unknown_name_error(notes_env):
+    result = runner.invoke(cli.app, ["-l", "acme", "--name", "nope"])
+    assert result.exit_code == 1
+    assert "no session named 'nope'" in result.output
+
+
+def test_label_with_a_bare_sign_errors(notes_env):
+    result = runner.invoke(cli.app, ["--label=-", "--name", "alpha"])
+    assert result.exit_code == 1
+    assert "not a label" in result.output
+
+
+def test_notes_never_open_the_menu_or_a_session(notes_env, monkeypatch):
+    monkeypatch.setattr(
+        cli, "_interactive_menu", lambda *a, **k: pytest.fail("menu opened")
+    )
+    assert runner.invoke(cli.app, ["-l", "acme", "--name", "alpha"]).exit_code == 0
+    assert runner.invoke(cli.app, ["-t", "Acme", "--name", "alpha"]).exit_code == 0
+
+
+def test_notes_alongside_a_url_annotate_the_new_session(monkeypatch, tmp_path):
+    """`vv <url> -t TEXT -l TAG` forwards the notes into the create flow."""
+    from vv import notes
+
+    seen: dict = {}
+    monkeypatch.setattr(
+        cli, "_start_from_url",
+        lambda url, agent, bypass, name=None, pending_notes=None: seen.update(
+            notes=pending_notes
+        ),
+    )
+    monkeypatch.delenv("VV_AGENT", raising=False)
+    monkeypatch.setenv("VV_CONFIG", str(tmp_path / "missing.toml"))
+    result = runner.invoke(cli.app, ["-t", "Acme", "-l", "acme", "-l", "urgent", _REPO_URL])
+    assert result.exit_code == 0, result.output
+    assert seen["notes"] == notes.Pending(title="Acme", label_specs=("acme", "urgent"))
+
+
+def test_a_new_session_records_its_notes(chat_env):
+    from vv import notes
+
+    cli._new_chat_session(
+        "claude", bypass=False, name="otter",
+        pending_notes=notes.Pending(title="Acme", label_specs=("acme",)),
+    )
+    note = notes.for_session(cli.CHATS, "otter")
+    assert note.title == "Acme" and note.labels == ["acme"]
+
+
+def test_a_bad_label_does_not_sink_a_created_session(chat_env, capsys):
+    from vv import notes
+
+    cli._new_chat_session(
+        "claude", bypass=False, name="otter",
+        pending_notes=notes.Pending(title="Acme", label_specs=("-",)),
+    )
+    assert (chat_env / "wt" / "_chats" / "otter").is_dir()   # session still created
+    note = notes.for_session(cli.CHATS, "otter")
+    assert note.title == "Acme" and note.labels == []        # title still applied
+    assert "labels not applied" in capsys.readouterr().out
+
+
+def test_deleting_a_session_forgets_its_notes(chat_env):
+    from vv import notes
+
+    cli._new_chat_session(
+        "claude", bypass=False, name="otter",
+        pending_notes=notes.Pending(title="Acme", label_specs=("acme",)),
+    )
+    cli._delete_chat("otter", chat_env / "wt" / "_chats" / "otter", live=set())
+    assert notes.all_notes() == {}
+
+
+def test_deleting_a_repo_forgets_its_sessions_notes(repo_delete_harness):
+    from vv import notes
+
+    notes.apply_labels("repo", "falcon", ["acme"])
+    notes.set_title("other", "gamma", "keep me")
+    repo_delete_harness(worktrees=["falcon"])
+    cli._delete_repo("repo")
+    assert list(notes.all_notes()) == ["other/gamma"]
+
+
+def test_remote_mode_forwards_title_and_label_specs(remote_harness):
+    seen, write_config = remote_harness
+    write_config('[remote]\nhost = "h"\n')
+    result = runner.invoke(
+        cli.app, ["--remote", "-t", "Acme", "-l", "acme", "--label=-old", _REPO_URL]
+    )
+    assert result.exit_code == 0, result.output
+    # "=" form so the remote's parser can't read a removal's '-' as a flag
+    assert seen["argv"] == [
+        "--name", "otter", "--local",
+        "--title=Acme", "--label=acme", "--label=-old", _REPO_URL,
+    ]
+
+
+def test_annotating_an_existing_session_stays_local_in_remote_mode(
+    remote_harness, notes_env, monkeypatch
+):
+    """`vv -l TAG` / `-t TEXT` is local bookkeeping — it must not open a cmux tab."""
+    from vv import notes
+
+    seen, write_config = remote_harness
+    write_config('mode = "remote"\n[remote]\nhost = "h"\n')
+    monkeypatch.chdir(notes_env)
+    result = runner.invoke(cli.app, ["-l", "acme", "-t", "Acme"])
+    assert result.exit_code == 0, result.output
+    assert seen == {}                                   # no remote launch
+    note = notes.for_session("repo", "alpha")
+    assert note.labels == ["acme"] and note.title == "Acme"
+
+
 # --- session summary caching ------------------------------------------------
 
 def test_session_summaries_only_regenerates_changed_sessions(monkeypatch, tmp_path):
@@ -778,6 +1015,58 @@ def test_card_lines_layout_and_uniform_width():
     assert "breezy · repo/breezy" in rows[2]
     assert "⎇" not in rows[2]
     assert "2h ago" in rows[3]                                 # timestamp right-aligned
+
+
+def test_card_lines_show_a_user_title_above_the_summary():
+    rows = _plain(cli._card_lines(_git_card(title="Acme onboarding"), width=54))
+    assert "▹ Acme onboarding" in rows[1]                  # the title is the headline…
+    assert "Refactoring the auth flow" in rows[2]          # …and the summary stays
+    assert rows[2].startswith("│   ")                      # indented under the title
+    assert "breezy · repo/breezy" in rows[3]
+    assert all(len(r) == len(rows[0]) for r in rows)
+
+
+def test_card_title_and_summary_are_styled_apart():
+    rows = cli._card_lines(_git_card(title="Acme onboarding"), width=54)
+    styles = {text.strip(): style for row in rows for style, text in row if text.strip()}
+    assert styles["Acme onboarding"] == "class:card.title"
+    assert styles["Refactoring the auth flow"] == "class:card.summary"
+
+
+def test_card_without_a_title_renders_the_summary_as_the_headline():
+    # Unchanged from before titles existed: dot + summary, in the title style.
+    rows = cli._card_lines(_git_card(), width=54)
+    assert ("class:card.title", "Refactoring the auth flow") in rows[1]
+    assert len(rows) == 5                                  # no extra row added
+
+
+def test_card_with_a_title_but_no_summary_shows_only_the_title():
+    rows = _plain(cli._card_lines(_git_card(title="Acme onboarding", summary=None), width=54))
+    assert "▹ Acme onboarding" in rows[1]
+    assert len(rows) == 5                                  # no empty summary row
+    assert "breezy · repo/breezy" in rows[2]
+
+
+def test_card_lines_show_labels_under_the_title():
+    rows = _plain(cli._card_lines(_git_card(labels=["Big Customer", "urgent"]), width=54))
+    assert "Refactoring the auth flow" in rows[1]
+    assert "#Big Customer  #urgent" in rows[2]      # labels sit directly under the title
+    assert rows[2].startswith("│   #")              # indented to line up with the title
+    assert "breezy · repo/breezy" in rows[3]        # branch line pushed down
+    assert all(len(r) == len(rows[0]) for r in rows)
+
+
+def test_card_lines_omit_the_label_row_when_there_are_none():
+    # A card with no labels (or the key absent entirely) renders as before.
+    for card in (_git_card(), _git_card(labels=[])):
+        rows = _plain(cli._card_lines(card, width=54))
+        assert len(rows) == 5 and "breezy · repo/breezy" in rows[2]
+
+
+def test_card_lines_wrap_a_long_label_row():
+    rows = _plain(cli._card_lines(_git_card(labels=[f"label-{i}" for i in range(8)]), width=54))
+    assert "#label-0" in rows[2] and "#label-7" in rows[3]   # wrapped onto a second row
+    assert all(len(r) == len(rows[0]) for r in rows)         # still uniform width
 
 
 def test_card_lines_branch_shows_dirty_asterisk():

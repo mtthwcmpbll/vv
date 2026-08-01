@@ -27,6 +27,39 @@ Run with no arguments for an interactive menu:
   and start a new worktree session for it.
 - **Add a new repo** — paste a git URL and start a session from it.
 
+## Titles and labels
+
+Two manual levers for keeping many sessions straight: a **title** you write
+yourself, and **labels** — a customer name, a ticket, a note. Both show on the
+session cards in the interactive menu:
+
+```
+╭────────────────────────────────────────────────────────╮
+│ ▸ Acme onboarding                                      │  <- your title
+│   Wiring the notes store into the session cards        │  <- generated summary
+│   #Big Customer  #urgent                               │  <- your labels
+│ alpha · repo/alpha                                     │
+│ ○ PR #12 ✓ passing                          10m ago    │
+╰────────────────────────────────────────────────────────╯
+```
+
+A title doesn't replace the generated summary — it sits above it.
+
+```sh
+vv --title "Acme onboarding"           # title the session you're in
+vv -t ""                               # clear the title
+vv --label acme                        # tag it
+vv -l acme -l "needs review"           # repeatable, spaces are fine
+vv --label=-acme                       # a leading '-' removes the label
+vv -t "Acme" -l acme --name falcon     # annotate another session by name
+vv -t "Acme" https://github.com/o/r.git  # annotate the session being created
+```
+
+Run from inside a session (or any subdirectory of it) and `vv` annotates that
+session; otherwise pass `--name`. Titles and labels live in
+`WORKTREES_DIR/.session-notes.json` and are forgotten when the session is
+deleted.
+
 ## Agent CLI
 
 `vv` launches `claude` by default, but any agentic CLI on your `PATH` works
@@ -79,6 +112,7 @@ uv run vv
 vv https://github.com/owner/repo.git   # clone + new worktree session
 vv git@github.com:owner/repo.git       # scp-style URLs work too
 vv --agent codex                       # choose the agent CLI for this run
+vv -t "Acme onboarding" -l acme        # title/label the session you're in
 vv                                     # interactive menu
 ```
 

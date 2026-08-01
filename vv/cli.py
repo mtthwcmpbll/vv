@@ -12,7 +12,19 @@ from pathlib import Path
 import questionary
 import typer
 
-from . import agents, cmux_ops, config, gh_ops, git_ops, names, pr, remote, summary, tmux_ops
+from . import (
+    agents,
+    cmux_ops,
+    config,
+    gh_ops,
+    git_ops,
+    names,
+    notes,
+    pr,
+    remote,
+    summary,
+    tmux_ops,
+)
 
 app = typer.Typer(
     add_completion=False,
@@ -155,13 +167,19 @@ def _resume_worktree(name: str, worktree_path: Path, agent: str, bypass: bool) -
 
 
 def _new_worktree_session(
-    repo_name: str, workspace: Path, agent: str, bypass: bool, name: str | None = None
+    repo_name: str,
+    workspace: Path,
+    agent: str,
+    bypass: bool,
+    name: str | None = None,
+    pending_notes: "notes.Pending | None" = None,
 ) -> None:
     """Create a worktree + tmux session for an already-cloned repo and attach.
 
     With no ``name`` a random collision-free one is picked; an explicit ``name``
     (e.g. forwarded from a remote launcher via ``--name``) is used as-is but
-    must not already be taken.
+    must not already be taken. Any ``pending_notes`` (from ``--title`` /
+    ``--label``) are stamped on the new session before it is handed the terminal.
     """
     worktree_root = config.worktrees_dir() / repo_name
 
@@ -183,10 +201,43 @@ def _new_worktree_session(
     )
     git_ops.add_worktree(workspace, worktree_path, branch=name, start_ref=start_ref)
 
+    _note_new_session(repo_name, name, pending_notes)
     _resume_worktree(name, worktree_path, agent, bypass)
 
 
-def _new_chat_session(agent: str, bypass: bool, name: str | None = None) -> None:
+def _note_new_session(
+    repo: str, name: str, pending: "notes.Pending | None"
+) -> None:
+    """Stamp ``--title`` / ``--label`` onto a session vv just created (best-effort).
+
+    A bad label spec is reported but never sinks the session that has already
+    been created — the user can always re-annotate it afterwards.
+    """
+    if not pending:
+        return
+    if pending.title is not None:
+        title = notes.set_title(repo, name, pending.title)
+        if title:
+            typer.secho(f"  title:    {title}", fg=typer.colors.GREEN)
+    if not pending.label_specs:
+        return
+    try:
+        current, _added, _removed = notes.apply_labels(
+            repo, name, list(pending.label_specs)
+        )
+    except notes.LabelError as exc:
+        typer.secho(f"  (labels not applied: {exc})", fg=typer.colors.YELLOW)
+        return
+    if current:
+        typer.secho(f"  labels:   {', '.join(current)}", fg=typer.colors.GREEN)
+
+
+def _new_chat_session(
+    agent: str,
+    bypass: bool,
+    name: str | None = None,
+    pending_notes: "notes.Pending | None" = None,
+) -> None:
     """Create an empty chat-only session dir and attach an agent to it.
 
     Chat sessions are not backed by a git worktree — they are just a plain
@@ -207,10 +258,17 @@ def _new_chat_session(agent: str, bypass: bool, name: str | None = None) -> None
     chat_path.mkdir(parents=True)
 
     typer.secho(f"Creating chat session '{name}'...", fg=typer.colors.CYAN)
+    _note_new_session(CHATS, name, pending_notes)
     _resume_worktree(name, chat_path, agent, bypass)
 
 
-def _start_from_url(repo_url: str, agent: str, bypass: bool, name: str | None = None) -> None:
+def _start_from_url(
+    repo_url: str,
+    agent: str,
+    bypass: bool,
+    name: str | None = None,
+    pending_notes: "notes.Pending | None" = None,
+) -> None:
     """Clone the repo if needed, then create a new worktree session."""
     repo_name = git_ops.repo_name_from_url(repo_url)
     workspace = config.workspaces_dir() / repo_name
@@ -245,7 +303,7 @@ def _start_from_url(repo_url: str, agent: str, bypass: bool, name: str | None = 
                 fg=typer.colors.YELLOW,
             )
 
-    _new_worktree_session(repo_name, workspace, agent, bypass, name)
+    _new_worktree_session(repo_name, workspace, agent, bypass, name, pending_notes)
 
 
 def _launch_remote(
@@ -254,6 +312,7 @@ def _launch_remote(
     agent: str | None,
     ask: bool | None,
     name: str | None,
+    pending_notes: "notes.Pending | None" = None,
 ) -> None:
     """Forward this invocation to vv on the configured remote, inside a cmux tab.
 
@@ -282,6 +341,12 @@ def _launch_remote(
         forward.append("--ask")
     elif ask is False:
         forward.append("--no-ask")
+    # "=" form throughout so a removal spec's leading '-' (or a title starting
+    # with one) can't be read as a flag by the remote's parser.
+    if pending_notes is not None and pending_notes.title is not None:
+        forward.append(f"--title={pending_notes.title}")
+    for spec in (pending_notes.label_specs if pending_notes else ()):
+        forward.append(f"--label={spec}")
     if chat:
         forward.append("--chat")
     if repo_url:
@@ -323,6 +388,7 @@ def _delete_chat(name: str, path: Path, live: set[str]) -> None:
     if name in live:
         tmux_ops.kill_session(name)
     shutil.rmtree(path)
+    notes.forget(CHATS, name)
     typer.secho(f"Deleted chat '{name}'.", fg=typer.colors.GREEN)
 
 
@@ -357,7 +423,81 @@ def _delete_session(repo: str, name: str, path: Path, live: set[str]) -> None:
         tmux_ops.kill_session(name)
     git_ops.remove_worktree(workspace, path, force=True)
     git_ops.delete_branch(workspace, name, force=True)
+    notes.forget(repo, name)
     typer.secho(f"Deleted worktree '{repo}/{name}'.", fg=typer.colors.GREEN)
+
+
+def _session_from_cwd() -> tuple[str, str, Path] | None:
+    """Return the ``(repo, name, path)`` of the session the cwd is inside, if any.
+
+    vv sessions run rooted at their worktree/chat dir, so the current directory
+    identifies the session you are in — including from a subdirectory of it.
+    Returns ``None`` when the cwd belongs to no session.
+    """
+    try:
+        cwd = Path.cwd().resolve()
+    except OSError:
+        return None
+    for repo, name, path in _list_worktrees():
+        try:
+            resolved = path.resolve()
+        except OSError:
+            continue
+        if cwd == resolved or resolved in cwd.parents:
+            return repo, name, path
+    return None
+
+
+def _find_session(name: str) -> tuple[str, str, Path] | None:
+    """Return the ``(repo, name, path)`` of the session called ``name``, if any."""
+    for session in _list_worktrees():
+        if session[1] == name:
+            return session
+    return None
+
+
+def _apply_notes(pending: notes.Pending, name: str | None) -> None:
+    """Set the title and/or labels on an existing session.
+
+    Backs ``vv --title TEXT`` / ``vv --label TAG``: targets the session named by
+    ``--name``, else the one the cwd is inside — so inside a session you can
+    just annotate it. Each label spec adds a label, or removes it when prefixed
+    with ``-``; a blank title clears the title.
+    """
+    if name:
+        session = _find_session(name)
+        if session is None:
+            raise _fail(f"no session named '{name}'")
+    else:
+        session = _session_from_cwd()
+        if session is None:
+            raise _fail(
+                "not inside a vv session — run this from a session, or pass --name NAME"
+            )
+
+    repo, session_name, _path = session
+    if pending.title is not None:
+        title = notes.set_title(repo, session_name, pending.title)
+        typer.secho(
+            f"  title: {title}" if title else "  title cleared",
+            fg=typer.colors.GREEN if title else typer.colors.YELLOW,
+        )
+
+    if pending.label_specs:
+        try:
+            current, added, removed = notes.apply_labels(
+                repo, session_name, list(pending.label_specs)
+            )
+        except notes.LabelError as exc:
+            raise _fail(str(exc)) from exc
+        for label in added:
+            typer.secho(f"  + {label}", fg=typer.colors.GREEN)
+        for label in removed:
+            typer.secho(f"  - {label}", fg=typer.colors.YELLOW)
+        shown = ", ".join(current) if current else "(none)"
+        typer.secho(f"  labels: {shown}", fg=typer.colors.CYAN)
+
+    typer.secho(f"Session '{repo}/{session_name}' updated.", fg=typer.colors.CYAN)
 
 
 def _session_summaries(
@@ -438,15 +578,20 @@ def _menu_list_sessions(default_agent: str, bypass: bool) -> None:
     pr_cached = pr_snapshot.cached
     pr_stale = pr_snapshot.stale_keys
 
+    note_store = notes.all_notes()
+
     cards: list[dict] = []
     choices: list[questionary.Choice] = []
     card_by_key: dict[tuple[str, str], dict] = {}
     for repo, name, path in worktrees:
         is_git = (path / ".git").exists()
         key = (repo, name)
+        note = note_store.get(notes.session_id(repo, name), notes.Note())
         card = {
             "running": name in live,
+            "title": note.title,          # user-set; sits above the summary
             "summary": summaries.get(key),
+            "labels": note.labels,
             "branch": name if is_git else None,  # vv's worktree branch is its name
             "dirty": _worktree_dirty(path) if is_git else False,
             "folder": f"{repo}/{name}",
@@ -498,6 +643,8 @@ _DEFAULT_GLYPHS: dict[str, str] = {
     "idle": "▹",           # idle session (outline right triangle)
     "dirty": "✱",          # uncommitted/unpushed marker after the branch
     "separator": " · ",    # between branch and folder
+    "label": "#",          # prefix on each user-assigned label
+    "label_gap": "  ",     # between labels (wide enough to read multi-word ones)
     "chat": "❝",           # chat-session line
     "pr_open": "○",        # open PR (outline circle)
     "pr_draft": "◌",       # draft PR (dotted circle)
@@ -520,6 +667,8 @@ _DEFAULT_COLORS: dict[str, str] = {
     "running": "ansigreen bold",
     "idle": "ansibrightblack",
     "title": "bold",
+    "summary": "ansibrightblack",  # generated summary, under a user-set title
+    "label": "ansimagenta",
     "branch": "ansicyan",
     "dirty": "ansiyellow bold",
     "folder": "ansibrightblack",
@@ -663,10 +812,28 @@ def _card_lines(
 
     dot_style = "class:card.dot.run" if card["running"] else "class:card.dot.idle"
     dot = g["running"] if card["running"] else g["idle"]
-    summary_lines = textwrap.wrap(card["summary"] or "", inner - 2) or ["(no summary yet)"]
-    for i, line in enumerate(summary_lines):
-        prefix = [(dot_style, f"{dot} ")] if i == 0 else [("", "  ")]
+
+    # The headline is the user's own title when they set one, else the generated
+    # summary; the dot leads it. A title doesn't replace the summary — the
+    # summary follows underneath it, in its own (quieter) style.
+    title = card.get("title")
+    headline = title or card["summary"] or "(no summary yet)"
+    body_lines = textwrap.wrap(card["summary"] or "", inner - 2) if title else []
+
+    first = True
+    for line in textwrap.wrap(headline, inner - 2) or [headline]:
+        prefix = [(dot_style, f"{dot} ")] if first else [("", "  ")]
         rows.append(content_row([*prefix, ("class:card.title", line)]))
+        first = False
+    for line in body_lines:
+        rows.append(content_row([("", "  "), ("class:card.summary", line)]))
+
+    # User-assigned labels sit just under the title, indented to line up with it.
+    chips = g["label_gap"].join(
+        f"{g['label']}{label}" for label in card.get("labels") or []
+    )
+    for line in textwrap.wrap(chips, inner - 2):
+        rows.append(content_row([("", "  "), ("class:card.label", line)]))
 
     if card["branch"]:
         # branch [dirty] <separator> folder. No leading glyph: an uncommon symbol
@@ -759,6 +926,8 @@ def _card_style(theme: "CardTheme | None" = None):
         ("card.dot.run", c["running"]),
         ("card.dot.idle", c["idle"]),
         ("card.title", c["title"]),
+        ("card.summary", c["summary"]),
+        ("card.label", c["label"]),
         ("card.branch", c["branch"]),
         ("card.dirty", c["dirty"]),
         ("card.folder", c["folder"]),
@@ -985,6 +1154,7 @@ def _delete_repo(repo: str) -> None:
     if worktrees_root.exists():
         shutil.rmtree(worktrees_root)
     shutil.rmtree(workspace)
+    notes.forget_repo(repo)
     typer.secho(f"Deleted repo '{repo}'.", fg=typer.colors.GREEN)
 
 
@@ -1171,7 +1341,27 @@ def main(
         "--name",
         metavar="NAME",
         help="Use this exact session/worktree name instead of a random one. "
-        "Forwarded by remote mode so the cmux tab mirrors the remote session.",
+        "Forwarded by remote mode so the cmux tab mirrors the remote session. "
+        "With --title/--label, names the session to annotate.",
+    ),
+    title: str = typer.Option(
+        None,
+        "--title",
+        "-t",
+        metavar="TEXT",
+        help="Set the session's title, shown above its generated summary on the "
+        "session card. Pass an empty string to clear it. On its own it titles "
+        "the session you are in (or --name NAME); alongside a repo URL or "
+        "--chat it titles the new session.",
+    ),
+    label: list[str] = typer.Option(
+        None,
+        "--label",
+        "-l",
+        metavar="TAG",
+        help="Attach TAG to a session (repeatable). A leading '-' removes it "
+        "(use --label=-TAG). On its own it labels the session you are in (or "
+        "--name NAME); alongside a repo URL or --chat it labels the new session.",
     ),
     emit_cwd: str = typer.Option(
         None,
@@ -1204,18 +1394,27 @@ def main(
             else "local" if remote_mode is False
             else config.configured_mode()
         )
+        pending_notes = notes.Pending(title=title, label_specs=tuple(label or []))
+
+        # Annotating an *existing* session is pure local bookkeeping on the
+        # machine whose sessions they are, so it never routes through remote
+        # mode: inside a remote session you are already running the remote vv.
+        if pending_notes and not (repo_url or chat):
+            _apply_notes(pending_notes, name)
+            return
+
         if mode == "remote":
             if chat and repo_url:
                 raise _fail("--chat cannot be combined with a repo URL")
-            _launch_remote(repo_url, chat, agent, ask, name)
+            _launch_remote(repo_url, chat, agent, ask, name, pending_notes)
             return
 
         if chat:
             if repo_url:
                 raise _fail("--chat cannot be combined with a repo URL")
-            _new_chat_session(resolved_agent, bypass, name)
+            _new_chat_session(resolved_agent, bypass, name, pending_notes)
         elif repo_url:
-            _start_from_url(repo_url, resolved_agent, bypass, name)
+            _start_from_url(repo_url, resolved_agent, bypass, name, pending_notes)
         else:
             _interactive_menu(resolved_agent, bypass)
     except (git_ops.GitError, tmux_ops.TmuxError, config.ConfigError, cmux_ops.CmuxError) as exc:

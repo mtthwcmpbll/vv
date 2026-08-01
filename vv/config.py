@@ -94,6 +94,15 @@ def pr_cache_file() -> Path:
     return worktrees_dir() / ".pr-status.json"
 
 
+def notes_file() -> Path:
+    """Path to the JSON store of user-set session notes (title + labels).
+
+    Sits alongside the caches inside :func:`worktrees_dir`, but unlike them it
+    holds user data that is never regenerated (see :mod:`vv.notes`).
+    """
+    return worktrees_dir() / ".session-notes.json"
+
+
 def config_file() -> Path:
     """Path to the vv TOML config file (override with ``VV_CONFIG``)."""
     raw = os.environ.get("VV_CONFIG")
