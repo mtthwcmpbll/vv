@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import shutil
 import textwrap
 import threading
@@ -1266,6 +1267,134 @@ def _menu_add_repo(default_agent: str, bypass: bool) -> None:
     _start_from_url(url, agent, bypass)
 
 
+# Sentinel choice in the template picker: create the repo with no template.
+_EMPTY_REPO = object()
+
+#: GitHub's own rule for repository names — letters, digits, '.', '-', '_'.
+_REPO_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _pick_template(templates: list[str]) -> object | None:
+    """Pick a template repo to generate a new project from, or an empty one.
+
+    Same shape as :func:`_pick_github_repo` — scrollable, filter-as-you-type,
+    5 rows — with the :data:`_EMPTY_REPO` sentinel first so "no template" is
+    always one keystroke away even when the list is long. Returns the chosen
+    ``owner/name``, the sentinel, or ``None`` if cancelled.
+    """
+    choices = [
+        questionary.Choice(title="○  Empty repository (no template)", value=_EMPTY_REPO),
+        *templates,
+    ]
+    question = questionary.select(
+        "Start from which template (type to filter)?",
+        choices=choices,
+        use_search_filter=True,  # typing filters the list (substring match)
+        use_jk_keys=False,       # required with search filter: j/k become input
+        show_selected=False,
+    )
+    _cap_select_rows(question, 5)
+    return question.ask()
+
+
+def _pick_owner(owners: list[str]) -> str | None:
+    """Pick the account to create the new repo under (personal login first)."""
+    question = questionary.select(
+        "Create it under which account?",
+        choices=owners,
+        use_search_filter=True,
+        use_jk_keys=False,
+        show_selected=False,
+    )
+    _cap_select_rows(question, 5)
+    return question.ask()
+
+
+def _prompt_repo_name(owner: str) -> str | None:
+    """Ask for the new repository's name, validating it as you type.
+
+    Rejecting the name in the prompt (rather than after the fact) keeps a typo
+    from turning into a failed ``gh repo create`` round trip.
+    """
+    def valid(text: str) -> bool | str:
+        text = text.strip()
+        if not text:
+            return "Enter a repository name."
+        if not _REPO_NAME_RE.match(text):
+            return "Use only letters, digits, '.', '-' and '_'."
+        return True
+
+    answer = questionary.text(f"New repository name ({owner}/…):", validate=valid).ask()
+    return (answer or "").strip() or None
+
+
+def _menu_new_github_project(default_agent: str, bypass: bool) -> None:
+    """Create a brand-new GitHub repo (optionally from a template) and session it.
+
+    Walks template → owner → name → visibility, creates the repo with ``gh``,
+    then hands the clone URL to :func:`_start_from_url` so the result is exactly
+    the same as picking an existing repo: cloned into the workspace, a worktree
+    session created, agent attached.
+    """
+    if not gh_ops.is_available():
+        typer.secho(
+            "Creating a GitHub project needs the 'gh' CLI, installed and logged in "
+            "(`gh auth login`).",
+            fg=typer.colors.YELLOW,
+        )
+        return
+
+    typer.secho("Fetching your GitHub templates...", fg=typer.colors.CYAN)
+    picked = _pick_template(gh_ops.list_template_repos())
+    if picked is None:
+        return
+    template = None if picked is _EMPTY_REPO else str(picked)
+
+    owners = gh_ops.list_owners()
+    if not owners:
+        typer.secho(
+            "Could not determine which accounts you can create repos under.",
+            fg=typer.colors.YELLOW,
+        )
+        return
+    owner = _pick_owner(owners)
+    if owner is None:
+        return
+
+    name = _prompt_repo_name(owner)
+    if name is None:
+        return
+
+    # gh has no default visibility in non-interactive mode, and guessing wrong
+    # towards "public" is the one mistake here that can't be taken back.
+    visibility = questionary.select(
+        "Visibility:", choices=["private", "public"], default="private"
+    ).ask()
+    if visibility is None:
+        return
+
+    name_with_owner = f"{owner}/{name}"
+    typer.secho(f"Creating {name_with_owner}...", fg=typer.colors.CYAN)
+    gh_ops.create_repo(name_with_owner, template=template, private=visibility == "private")
+    typer.secho(f"Created {name_with_owner}.", fg=typer.colors.GREEN)
+
+    if template and not gh_ops.wait_for_commits(name_with_owner):
+        typer.secho(
+            "Timed out waiting for the template's contents to land — the clone "
+            "may come up empty; re-run vv on it once GitHub catches up.",
+            fg=typer.colors.YELLOW,
+        )
+
+    agent = _pick_agent(default_agent)
+    if agent is None:
+        return
+    _start_from_url(
+        gh_ops.clone_url(name_with_owner, config.configured_clone_protocol()),
+        agent,
+        bypass,
+    )
+
+
 def _menu_new_chat(default_agent: str, bypass: bool) -> None:
     """Start a fresh chat-only session (no git repo)."""
     agent = _pick_agent(default_agent)
@@ -1292,6 +1421,7 @@ def _interactive_menu(default_agent: str, bypass: bool) -> None:
         "●  List existing sessions": _menu_list_sessions,
         "➥  Start a new session from an existing repo": _menu_new_from_repo,
         "✚  Add a new repo": _menu_add_repo,
+        "✦  Create a new GitHub project": _menu_new_github_project,
         "❝  Start a chat-only session (no repo)": _menu_new_chat,
     }
     choice = questionary.select("What would you like to do?", choices=list(actions)).ask()
@@ -1417,7 +1547,13 @@ def main(
             _start_from_url(repo_url, resolved_agent, bypass, name, pending_notes)
         else:
             _interactive_menu(resolved_agent, bypass)
-    except (git_ops.GitError, tmux_ops.TmuxError, config.ConfigError, cmux_ops.CmuxError) as exc:
+    except (
+        git_ops.GitError,
+        tmux_ops.TmuxError,
+        config.ConfigError,
+        cmux_ops.CmuxError,
+        gh_ops.GhError,
+    ) as exc:
         raise _fail(str(exc)) from exc
     except KeyboardInterrupt:
         typer.secho("\nAborted.", fg=typer.colors.YELLOW, err=True)

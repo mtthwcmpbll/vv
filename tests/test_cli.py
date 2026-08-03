@@ -564,6 +564,195 @@ def test_add_repo_blank_url_aborts(add_repo_harness):
     assert seen == {}  # empty URL -> no session started
 
 
+# --- _menu_new_github_project ------------------------------------------------
+
+@pytest.fixture
+def new_project_harness(monkeypatch):
+    """Stub the whole create-a-GitHub-project flow around the menu action.
+
+    ``configure(...)`` wires gh availability, the template/owner/name/visibility
+    prompts and repo creation; the returned dict records what ``gh_ops.create_repo``
+    was called with and what URL reached ``_start_from_url``.
+    """
+    seen: dict = {}
+    monkeypatch.setattr(
+        cli, "_start_from_url",
+        lambda url, agent, bypass, name=None, pending_notes=None: seen.update(
+            url=url, agent=agent
+        ),
+    )
+    monkeypatch.setattr(cli, "_pick_agent", lambda default: "claude")
+    monkeypatch.setattr(cli.config, "configured_clone_protocol", lambda: "ssh")
+
+    def configure(
+        *,
+        templates=(),
+        picked=None,
+        owners=("octocat",),
+        owner="octocat",
+        name="thing",
+        visibility="private",
+        available=True,
+        waited=True,
+        create=None,
+    ):
+        def record_create(nwo, *, template=None, private=True):
+            seen.update(created=nwo, template=template, private=private)
+            if create is not None:
+                raise create
+
+        monkeypatch.setattr(cli.gh_ops, "is_available", lambda: available)
+        monkeypatch.setattr(cli.gh_ops, "list_template_repos", lambda: list(templates))
+        monkeypatch.setattr(cli.gh_ops, "list_owners", lambda: list(owners))
+        monkeypatch.setattr(cli.gh_ops, "create_repo", record_create)
+        monkeypatch.setattr(
+            cli.gh_ops, "wait_for_commits",
+            lambda nwo, **k: seen.update(waited_for=nwo) or waited,
+        )
+        monkeypatch.setattr(cli, "_pick_template", lambda _t: picked)
+        monkeypatch.setattr(cli, "_pick_owner", lambda _o: owner)
+        monkeypatch.setattr(cli, "_prompt_repo_name", lambda _o: name)
+        monkeypatch.setattr(
+            cli.questionary, "select", lambda *a, **k: _Answer(visibility)
+        )
+        return seen
+
+    return configure
+
+
+def test_new_project_empty_repo_creates_and_starts_session(new_project_harness):
+    seen = new_project_harness(picked=cli._EMPTY_REPO)
+    cli._menu_new_github_project("claude", bypass=True)
+    assert seen["created"] == "octocat/thing"
+    assert seen["template"] is None
+    assert seen["private"] is True
+    # Ends in exactly the existing-repo flow, via the configured protocol.
+    assert seen["url"] == "git@github.com:octocat/thing.git"
+    assert seen["agent"] == "claude"
+
+
+def test_new_project_from_template_passes_it_through(new_project_harness):
+    seen = new_project_harness(templates=["octo/tpl"], picked="octo/tpl")
+    cli._menu_new_github_project("claude", bypass=True)
+    assert seen["template"] == "octo/tpl"
+    assert seen["url"] == "git@github.com:octocat/thing.git"
+
+
+def test_new_project_waits_for_template_content(new_project_harness):
+    """A generated repo is empty for a beat -- cloning too early loses the copy."""
+    seen = new_project_harness(templates=["octo/tpl"], picked="octo/tpl")
+    cli._menu_new_github_project("claude", bypass=True)
+    assert seen["waited_for"] == "octocat/thing"
+
+
+def test_new_project_empty_repo_does_not_wait(new_project_harness):
+    seen = new_project_harness(picked=cli._EMPTY_REPO)
+    cli._menu_new_github_project("claude", bypass=True)
+    assert "waited_for" not in seen  # nothing to wait for; vv seeds it on clone
+
+
+def test_new_project_still_sessions_after_content_timeout(new_project_harness):
+    seen = new_project_harness(templates=["o/t"], picked="o/t", waited=False)
+    cli._menu_new_github_project("claude", bypass=True)
+    assert seen["url"] == "git@github.com:octocat/thing.git"  # warned, not aborted
+
+
+def test_new_project_public_visibility(new_project_harness):
+    seen = new_project_harness(picked=cli._EMPTY_REPO, visibility="public")
+    cli._menu_new_github_project("claude", bypass=True)
+    assert seen["private"] is False
+
+
+def test_new_project_owner_selection_used(new_project_harness):
+    seen = new_project_harness(
+        picked=cli._EMPTY_REPO, owners=("octocat", "acme"), owner="acme"
+    )
+    cli._menu_new_github_project("claude", bypass=True)
+    assert seen["created"] == "acme/thing"
+
+
+def test_new_project_requires_gh(new_project_harness):
+    seen = new_project_harness(picked=cli._EMPTY_REPO, available=False)
+    cli._menu_new_github_project("claude", bypass=True)
+    assert seen == {}  # no gh -> nothing created
+
+
+def test_new_project_cancelled_template_aborts(new_project_harness):
+    seen = new_project_harness(picked=None)
+    cli._menu_new_github_project("claude", bypass=True)
+    assert seen == {}
+
+
+def test_new_project_cancelled_owner_aborts(new_project_harness):
+    seen = new_project_harness(picked=cli._EMPTY_REPO, owner=None)
+    cli._menu_new_github_project("claude", bypass=True)
+    assert seen == {}
+
+
+def test_new_project_cancelled_name_aborts(new_project_harness):
+    seen = new_project_harness(picked=cli._EMPTY_REPO, name=None)
+    cli._menu_new_github_project("claude", bypass=True)
+    assert seen == {}
+
+
+def test_new_project_cancelled_visibility_aborts(new_project_harness):
+    seen = new_project_harness(picked=cli._EMPTY_REPO, visibility=None)
+    cli._menu_new_github_project("claude", bypass=True)
+    assert seen == {}
+
+
+def test_new_project_no_owners_aborts(new_project_harness):
+    seen = new_project_harness(picked=cli._EMPTY_REPO, owners=())
+    cli._menu_new_github_project("claude", bypass=True)
+    assert seen == {}
+
+
+def test_new_project_creation_failure_propagates(new_project_harness):
+    """A failed create must not fall through to cloning a repo that isn't there."""
+    seen = new_project_harness(
+        picked=cli._EMPTY_REPO, create=cli.gh_ops.GhError("name taken")
+    )
+    with pytest.raises(cli.gh_ops.GhError):
+        cli._menu_new_github_project("claude", bypass=True)
+    assert "url" not in seen
+
+
+def test_new_project_is_in_the_main_menu(monkeypatch):
+    """The action is offered, and sits directly under 'Add a new repo'."""
+    monkeypatch.setattr(cli, "_banner", lambda: None)
+    labels: list[str] = []
+    monkeypatch.setattr(
+        cli.questionary, "select",
+        lambda _m, choices: labels.extend(choices) or _Answer(None),
+    )
+    cli._interactive_menu("claude", bypass=True)
+    matches = [i for i, label in enumerate(labels) if "GitHub project" in label]
+    assert matches, labels
+    assert "Add a new repo" in labels[matches[0] - 1]
+
+
+def test_prompt_repo_name_rejects_invalid_names(monkeypatch):
+    """The validator runs in the prompt, so a typo never reaches gh."""
+    captured: dict = {}
+
+    def fake_text(_message, validate=None):
+        captured["validate"] = validate
+        return _Answer("  thing  ")
+
+    monkeypatch.setattr(cli.questionary, "text", fake_text)
+    assert cli._prompt_repo_name("octocat") == "thing"  # trimmed
+    validate = captured["validate"]
+    assert validate("good-name_1.x") is True
+    assert isinstance(validate(""), str)
+    assert isinstance(validate("has space"), str)
+    assert isinstance(validate("owner/name"), str)
+
+
+def test_prompt_repo_name_blank_answer_is_none(monkeypatch):
+    monkeypatch.setattr(cli.questionary, "text", lambda *a, **k: _Answer(""))
+    assert cli._prompt_repo_name("octocat") is None
+
+
 def test_cap_select_rows_limits_choice_window_height():
     """_cap_select_rows caps the choices window so long lists scroll, not flood."""
     question = cli.questionary.select(

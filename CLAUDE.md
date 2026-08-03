@@ -58,8 +58,8 @@ Four flows, all ending in `_resume_worktree()`:
   version control. Cannot be combined with a repo URL.
 - **`vv`** (no args) → `cli._interactive_menu()`: a `questionary` menu to
   list existing sessions, start a worktree from an already-cloned repo, add a
-  repo (pick from your GitHub repos via `gh`, or paste a URL), or start a
-  chat-only session.
+  repo (pick from your GitHub repos via `gh`, or paste a URL), create a brand-new
+  GitHub project, or start a chat-only session.
 
 A fifth flow starts no session at all: **`vv --title TEXT`** (`-t`) /
 **`vv --label TAG`** (`-l`) → `cli._apply_notes()` annotates an *existing*
@@ -76,6 +76,32 @@ real pick resolves via `gh_ops.clone_url()` using the config's
 `clone_protocol` (`config.configured_clone_protocol()`, default `ssh`,
 override with `clone_protocol = "https"`). When gh is unavailable the flow is
 the original plain URL `questionary.text`. All paths feed `_start_from_url`.
+
+`_menu_new_github_project()` sits directly under "Add a new repo" in the menu and
+**creates** the repo before sessioning it, so a new project is one flow instead of
+"go to github.com, then come back". It walks four prompts — template → owner →
+name → visibility — and then feeds `_start_from_url` exactly like the picker
+above, so everything downstream (clone, worktree, tmux, agent) is the existing
+path. The template picker (`_pick_template()`) is `_pick_github_repo()`'s twin
+(same substring filter, same `_cap_select_rows(5)`) over
+`gh_ops.list_template_repos()`, with an `_EMPTY_REPO` sentinel first so "no
+template" stays one keystroke away in a long list. Templates are **filtered from
+the same cached `user/repos` walk** as the repo picker (`list_repos_detailed()`
+returns `(full_name, is_template)`; `--jq` is applied client-side to gh's cached
+response), so opening this menu right after the other costs no extra API calls.
+Owners come from `gh_ops.list_owners()` (the user's login first, then their orgs);
+the name is validated in the prompt (`_prompt_repo_name()`, GitHub's own
+`[A-Za-z0-9._-]` rule) so a typo never becomes a failed round trip. Visibility is
+an explicit prompt defaulting to **private**: `gh repo create` has no default in
+non-interactive mode, and guessing towards public is the one mistake here that
+can't be taken back. Two subtleties: (1) creation is the one gh call that
+**raises** (`gh_ops.GhError`) instead of degrading, since falling through to clone
+a repo that was never created would be worse than a clear failure; (2) generating
+from a template returns *before* GitHub finishes copying the files in, so
+`gh_ops.wait_for_commits()` polls until the repo has its first commit — otherwise
+the clone lands on an unborn HEAD and vv's empty-repo bootstrap seeds a root commit
+that diverges from the content arriving behind it. A poll timeout warns and
+continues rather than hanging.
 
 `_new_worktree_session()` picks a random collision-free word
 (`names.random_name()`, excluding existing tmux sessions, git branches, and
@@ -349,15 +375,25 @@ is verified; the others in `BYPASS_FLAGS` are best-guesses.
   `_PROMPT`), so a summary never feeds on a previous summary.
 - `git_ops.py` — `git` CLI wrappers; raises `GitError`.
 - `gh_ops.py` — optional `gh` (GitHub CLI) wrappers powering the "Add a new
-  repo" picker: `is_available()` (on PATH **and** authenticated),
-  `list_repos()` (every `owner/name` the user can access via the `user/repos`
-  API, paginated and `gh`-cached for an hour — spans org repos, not just the
-  user's own), and `clone_url()` (maps a picked `owner/name` to a github.com
-  URL in the caller-supplied protocol — SSH `git@github.com:…` by default, else
-  HTTPS; resolved from `config.configured_clone_protocol()`), and `pr_status()`
-  (runs `gh pr view` in a worktree → normalized `{number, state, checks}` for the
-  session card, or `None`). Unlike the other ops modules it **never raises** —
-  every failure degrades to `[]`/`None` so the menu falls back gracefully.
+  repo" picker and the "Create a new GitHub project" flow: `is_available()` (on
+  PATH **and** authenticated), `list_repos_detailed()` (every
+  `(owner/name, is_template)` the user can access via the `user/repos` API,
+  paginated and `gh`-cached for an hour — spans org repos, not just the user's
+  own) with `list_repos()` / `list_template_repos()` as views over that one
+  cached walk, `list_owners()` (login + orgs, for "who owns the new repo"),
+  `create_repo()` (`gh repo create`, optionally `--template`), `has_commits()` /
+  `wait_for_commits()` (poll a freshly generated repo until GitHub finishes
+  copying the template in), `clone_url()` (maps a picked `owner/name` to a
+  github.com URL in the caller-supplied protocol — SSH `git@github.com:…` by
+  default, else HTTPS; resolved from `config.configured_clone_protocol()`), and
+  `pr_status()` (runs `gh pr view` in a worktree → normalized
+  `{number, state, checks}` for the session card, or `None`). The *discovery*
+  helpers **never raise** — every failure degrades to `[]`/`None` so the menu
+  falls back gracefully; `create_repo()` is the one deliberate exception
+  (`GhError`, caught in `cli.main()` with the other ops errors) because it
+  mutates GitHub and there is nothing to fall back to.
+  Note: `gh api` silently switches to **POST** as soon as any `-f` parameter is
+  present, so every read that passes one must also pass `-X GET` or it 404s.
 - `pr.py` — cached, background-refreshed pull-request status for the session
   cards. `Snapshot(sessions)` exposes `.cached` (PR statuses already known, no
   `gh` calls) and `.stale_keys` (sessions to refetch); `.refresh(on_result, stop)`

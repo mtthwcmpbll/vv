@@ -26,6 +26,12 @@ Run with no arguments for an interactive menu:
 - **Start a new session from an existing repo** — pick an already-cloned repo
   and start a new worktree session for it.
 - **Add a new repo** — paste a git URL and start a session from it.
+- **Create a new GitHub project** — make a brand-new repo and session it in one
+  go. Pick one of your GitHub **template** repos (type to filter) or "Empty
+  repository", choose the account or organization to own it, name it, and pick
+  its visibility; `vv` creates it with `gh`, clones it, and drops you into a
+  session exactly as if the repo had already existed. Needs the
+  [`gh` CLI](https://cli.github.com) installed and logged in.
 
 ## Titles and labels
 
