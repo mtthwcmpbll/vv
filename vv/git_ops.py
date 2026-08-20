@@ -56,18 +56,22 @@ def fetch(workspace: Path) -> None:
 def default_start_ref(workspace: Path) -> str:
     """Return the best ref to branch new worktrees from.
 
-    Prefers the remote's default branch (``origin/HEAD``); falls back to the
-    local ``HEAD``.
+    Prefers the remote's default branch (``origin/HEAD``), then the checked-out
+    branch's upstream (for a clone whose ``origin/HEAD`` was never set). Both
+    are *remote-tracking* refs, so a :func:`fetch` beforehand makes them the
+    latest remote state rather than whatever the clone last saw. Falls back to
+    the local ``HEAD``, which can be stale — fetching cannot move it.
     """
-    try:
-        ref = _run(
-            ["git", "-C", str(workspace), "symbolic-ref", "refs/remotes/origin/HEAD"],
-            capture=True,
-        )
-        if ref:
+    for args in (
+        ["symbolic-ref", "refs/remotes/origin/HEAD"],
+        ["rev-parse", "--symbolic-full-name", "@{upstream}"],
+    ):
+        try:
+            ref = _run(["git", "-C", str(workspace), *args], capture=True)
+        except GitError:
+            continue
+        if ref.startswith("refs/remotes/"):
             return ref.removeprefix("refs/remotes/")
-    except GitError:
-        pass
     return "HEAD"
 
 
@@ -213,6 +217,24 @@ def unpushed_count(worktree_path: Path) -> int:
         [
             "git", "-C", str(worktree_path),
             "rev-list", "--count", "HEAD", "--not", "--remotes",
+        ],
+        capture=True,
+    )
+    return int(out or "0")
+
+
+def commits_ahead(worktree_path: Path, base_ref: str) -> int:
+    """Return the number of commits on HEAD that are not on ``base_ref``.
+
+    How much work a session's branch carries of its own — ``0`` means the branch
+    still sits exactly where it was cut from (nothing committed here), whether or
+    not it has been pushed. Complements :func:`unpushed_count`, which only sees
+    what has *not* reached a remote.
+    """
+    out = _run(
+        [
+            "git", "-C", str(worktree_path),
+            "rev-list", "--count", f"{base_ref}..HEAD",
         ],
         capture=True,
     )

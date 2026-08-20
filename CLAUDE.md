@@ -44,7 +44,8 @@ session if one is running, or starts a fresh one otherwise.
 Four flows, all ending in `_resume_worktree()`:
 
 - **`vv <repo_url>`** → `cli._start_from_url()`: clone into
-  `WORKSPACES_DIR/<repo>` (or fetch if already present), then
+  `WORKSPACES_DIR/<repo>` (reused as-is if already present — the fetch belongs
+  to `_new_worktree_session()`, see below), then
   `_new_worktree_session()`. A brand-new remote with no commits clones to an
   unborn HEAD (nothing to branch from), so when `git_ops.has_head_commit()` is
   false the default branch is first bootstrapped with an empty root commit
@@ -106,7 +107,16 @@ continues rather than hanging.
 `_new_worktree_session()` picks a random collision-free word
 (`names.random_name()`, excluding existing tmux sessions, git branches, and
 worktree dirs), creates a worktree on a new branch of that name off the remote
-default branch, then calls `_resume_worktree()`.
+default branch, then calls `_resume_worktree()`. It **fetches first**
+(`git_ops.fetch()`), for every create flow rather than in any one of them: a
+session cut from a stale `origin/main` starts behind and has to be caught up by
+hand later, and the menu's "new session from an existing repo" path in
+particular has no other reason to touch the network. The fetch is best-effort —
+an unreachable remote is a warning, not a refusal, it just means branching off
+the refs already on disk. `git_ops.default_start_ref()` then resolves
+`origin/HEAD`, else the checked-out branch's `@{upstream}` (both
+*remote-tracking*, so the fetch is what makes them current), else local `HEAD`
+— which fetching cannot move, so that last fallback can still be stale.
 
 `_resume_worktree()` is the core: given a worktree name + path + agent, it
 attaches to the live tmux session of that name if one exists, otherwise starts
@@ -128,7 +138,19 @@ public hook — and returns a `("select" | "delete" | "cancel", repo)` tuple.)
 
 The "list existing sessions" menu (`_menu_list_sessions()`) offers each chosen
 worktree a **resume** (→ `_resume_session()`) or **delete** (→
-`_delete_session()`) action. Before rendering, `_session_summaries()` produces
+`_delete_session()`) action, plus a **sweep** of all the stale ones at once
+(→ `_sweep_stale_sessions()`, see below). It is a **loop**: a delete or sweep
+rebuilds and redraws the list instead of leaving the menu, so a run of stale
+sessions can be cleaned up in one visit (resume and cancel still leave; an
+emptied list exits with "No sessions left."). The cursor is carried across the
+redraw — `_delete_session()` /
+`_delete_chat()` return whether they actually deleted (a declined confirm is
+`False`), so the menu focuses the session that slid into the deleted one's slot
+(`_next_focus()`: below, else above) or stays on a kept one. Focus reaches the
+picker as `_pick_session(focus=…)`, mapped from the `(repo, name)` key to the
+live choice value by `_focus_value()` and passed to questionary's `default`
+(which sets the initial `pointed_at`); an unmatched key degrades to `None`.
+Before rendering, `_session_summaries()` produces
 a one-line description of what each session is working on. Summaries are
 **cached** on disk (`config.summary_cache_file()` → `WORKTREES_DIR/.summaries.json`)
 keyed by a cheap *activity fingerprint* (`summary.session_fingerprint()`: the
@@ -195,15 +217,57 @@ conversation for this session (later agents aren't checked), since vv doesn't
 record which agent ran a session. It is entirely best-effort: if the summary
 agent has no known print-mode invocation (`summary.PRINT_FLAGS`, only `claude`'s
 is verified), no store has a transcript, or every summary fails, the menu just
-shows whatever context it could get (or no description at all). Deletion first checks `git_ops.is_dirty()` and
-`git_ops.unpushed_count()`; if either flags work that would be lost it requires
-a `questionary.confirm()` before proceeding. It then kills any live tmux
-session and runs `git_ops.remove_worktree(force=True)` +
-`git_ops.delete_branch(force=True)` — so a deleted worktree frees its name for
-reuse. Chat sessions branch through `_delete_chat()` instead: no git ops, but
-the user is still warned if the directory is non-empty before `shutil.rmtree`.
-Both deletions (and `_delete_repo()`, via `notes.forget_repo()`) call
-`notes.forget()` so a deleted session's notes don't linger in the store.
+shows whatever context it could get (or no description at all). Deletion first
+asks `_work_at_risk()` (→ `git_ops.is_dirty()` + `git_ops.unpushed_count()`); if
+either flags work that would be lost it requires a `questionary.confirm()` before
+proceeding. The mechanics then live in `_remove_session()` — kill any live tmux
+session, `git_ops.remove_worktree(force=True)` +
+`git_ops.delete_branch(force=True)` (so a deleted worktree frees its name for
+reuse), `notes.forget()` — deliberately **prompt-free**, because the batch sweep
+confirms once for many sessions and must not re-ask per session. Chat sessions
+branch through `_delete_chat()` for their warning (no git ops, but the user is
+still warned if the directory is non-empty) and `_remove_session()` `rmtree`s
+them. Every deletion path (plus `_delete_repo()`, via `notes.forget_repo()`)
+clears the session's notes so they don't linger in the store.
+
+#### Bulk cleanup of stale sessions (Shift+X)
+
+Sessions accumulate faster than they get deleted, so the session list binds
+**`X`** (Shift+X, next to `x`-deletes-one) to `_sweep_stale_sessions()`: it
+proposes every stale session, prints the list to **smoke-test first**, and
+deletes the lot behind a single `questionary.confirm()`. Nothing is touched
+before that confirm. The pointed-at session rides along with the `_SWEEP`
+sentinel so the cursor can be restored after the redraw.
+
+`_classify_stale()` owns the definition, and errs towards keeping things —
+a wrongly-swept session is unrecoverable, a wrongly-kept one costs a keystroke.
+Two reasons qualify: the session's **PR is merged** (the work landed;
+`_REASON_MERGED`), or it has **no local changes** (`_REASON_UNTOUCHED`: clean
+tree, nothing unpushed, *and* `git_ops.commits_ahead()` = 0 against the repo's
+`default_start_ref()` — so the branch never diverged from where it was cut).
+`commits_ahead` is why a pushed branch with an open PR is not swept for looking
+"clean": `unpushed_count()` alone can't tell "nothing was ever done here" from
+"the work is pushed and under review". A **dirty working tree vetoes both
+reasons**: uncommitted changes exist nowhere else, so a merged PR doesn't make
+them safe to bin — such a session is only ever deleted one at a time via
+`_delete_session()`, whose per-session warning names what is being lost. Five
+deliberate exclusions, then: chat sessions (no branch and no PR to judge them
+by), a session with **uncommitted changes** (whatever its PR says), a **running**
+session for the untouched reason (that's the one you just opened — merged-PR
+sessions are still offered, with "session is running" listed as a cost), a
+session whose git state can't be read (skipped rather than assumed empty), and
+any open/draft/closed PR with commits behind it.
+A merged-PR session still reports its `_work_at_risk()` in the listing — merging
+says nothing about commits that never got pushed — so the confirmation is
+informed rather than blind.
+
+Two details worth keeping: (1) `_resolve_pr_status()` **blocks** on `gh` for any
+session the PR cache doesn't know (the cards' background refresh may not have
+landed, and treating an unknown PR as "not merged" would silently under-clean) —
+the one place in vv where waiting on `gh` is the right trade, and it prints
+"Checking N session(s)…" while it does; (2) removals are individually wrapped, so
+one locked worktree reports `! kept repo/name: …` and the rest of the batch still
+goes through — the closing tally is "Deleted N of M".
 
 ### Session notes (title + labels)
 

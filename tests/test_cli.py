@@ -211,6 +211,359 @@ def test_delete_does_not_kill_when_no_live_session(delete_harness, tmp_path):
     assert calls["killed"] == []
 
 
+def test_delete_reports_whether_it_deleted(delete_harness, tmp_path):
+    delete_harness(dirty=False, unpushed=0)
+    assert cli._delete_session("repo", "falcon", tmp_path / "wt", live=set()) is True
+    delete_harness(dirty=True, confirm=False)
+    assert cli._delete_session("repo", "falcon", tmp_path / "wt", live=set()) is False
+
+
+# --- _menu_list_sessions: deleting returns to the list -----------------------
+
+class _StubSnapshot:
+    """Stand-in for `pr.Snapshot` with nothing cached and no background work."""
+
+    cached: dict = {}
+    stale_keys: set = set()
+
+    def refresh(self, on_result, stop=None):
+        pass
+
+
+@pytest.fixture
+def sessions_menu(monkeypatch, tmp_path):
+    """Drive `_menu_list_sessions` with scripted picks, stubbing its data sources."""
+    state = {
+        "sessions": [],   # current (repo, name, path) tuples
+        "picks": [],      # scripted [(action, name), ...] answers from _pick_session
+        "declines": set(),  # names whose delete the user cancels
+        "deleted": [],    # names _delete_session was called for
+        "resumed": [],    # names _resume_session was called for
+        "focus": [],      # the focus value each _pick_session render got
+        "renders": 0,     # how many times the menu was drawn
+    }
+
+    monkeypatch.setattr(cli, "_list_worktrees", lambda: list(state["sessions"]))
+    monkeypatch.setattr(cli.tmux_ops, "list_sessions", lambda *a, **k: [])
+    monkeypatch.setattr(cli, "_session_summaries", lambda *a, **k: {})
+    monkeypatch.setattr(cli, "_worktree_dirty", lambda p: False)
+    monkeypatch.setattr(cli.notes, "all_notes", lambda: {})
+    monkeypatch.setattr(cli.pr, "Snapshot", lambda paths: _StubSnapshot())
+
+    def fake_pick(message, choices, cards, *a, focus=None, **kw):
+        state["renders"] += 1
+        state["focus"].append(None if focus is None else focus[1])
+        action, name = state["picks"].pop(0)
+        if action == "cancel":
+            return "cancel", None
+        value = next(c.value for c in choices if c.value[1] == name)
+        return action, value
+
+    def fake_delete(repo, name, path, live):
+        state["deleted"].append(name)
+        if name in state["declines"]:
+            return False
+        state["sessions"] = [s for s in state["sessions"] if s[1] != name]
+        return True
+
+    monkeypatch.setattr(cli, "_pick_session", fake_pick)
+    monkeypatch.setattr(cli, "_delete_session", fake_delete)
+    monkeypatch.setattr(
+        cli, "_resume_session",
+        lambda name, path, agent, live, bypass: state["resumed"].append(name),
+    )
+
+    def configure(names, picks, declines=()):
+        state["sessions"] = [("repo", n, tmp_path / n) for n in names]
+        state["picks"] = list(picks)
+        state["declines"] = set(declines)
+        return state
+
+    return configure
+
+
+def test_menu_returns_to_the_list_after_each_delete(sessions_menu):
+    state = sessions_menu(
+        ["alpha", "beta", "gamma"],
+        [("delete", "alpha"), ("delete", "beta"), ("cancel", None)],
+    )
+    cli._menu_list_sessions("claude", bypass=True)
+    assert state["deleted"] == ["alpha", "beta"]   # both cleaned up in one visit
+    assert state["renders"] == 3                   # redrawn after each delete
+    assert [s[1] for s in state["sessions"]] == ["gamma"]
+
+
+def test_menu_delete_keeps_the_cursor_on_the_next_session(sessions_menu):
+    state = sessions_menu(
+        ["alpha", "beta", "gamma"],
+        [("delete", "beta"), ("delete", "gamma"), ("cancel", None)],
+    )
+    cli._menu_list_sessions("claude", bypass=True)
+    # beta -> the one below it (gamma); gamma was last, so fall back to above.
+    assert state["focus"] == [None, "gamma", "alpha"]
+
+
+def test_menu_delete_declined_stays_on_that_session(sessions_menu):
+    state = sessions_menu(
+        ["alpha", "beta"],
+        [("delete", "alpha"), ("cancel", None)],
+        declines=["alpha"],
+    )
+    cli._menu_list_sessions("claude", bypass=True)
+    assert [s[1] for s in state["sessions"]] == ["alpha", "beta"]
+    assert state["focus"] == [None, "alpha"]
+
+
+def test_menu_resume_leaves_the_menu(sessions_menu):
+    state = sessions_menu(["alpha", "beta"], [("select", "beta")])
+    cli._menu_list_sessions("claude", bypass=True)
+    assert state["resumed"] == ["beta"]
+    assert state["renders"] == 1
+
+
+def test_menu_exits_when_the_last_session_is_deleted(sessions_menu):
+    state = sessions_menu(["alpha"], [("delete", "alpha")])
+    cli._menu_list_sessions("claude", bypass=True)   # no pick left to answer
+    assert state["deleted"] == ["alpha"]
+    assert state["renders"] == 1
+
+
+def test_next_focus_prefers_below_then_above():
+    order = [("r", "a"), ("r", "b"), ("r", "c")]
+    assert cli._next_focus(order, ("r", "a")) == ("r", "b")
+    assert cli._next_focus(order, ("r", "c")) == ("r", "b")
+    assert cli._next_focus([("r", "a")], ("r", "a")) is None
+    assert cli._next_focus(order, ("r", "z")) is None
+
+
+def test_menu_sweep_returns_to_the_list(sessions_menu, monkeypatch):
+    state = sessions_menu(["alpha", "beta"], [("sweep", "beta"), ("cancel", None)])
+    swept: list = []
+
+    def fake_sweep(worktrees, live, card_by_key):
+        swept.append([n for _r, n, _p in worktrees])
+        state["sessions"] = [s for s in state["sessions"] if s[1] != "alpha"]
+        return 1
+
+    monkeypatch.setattr(cli, "_sweep_stale_sessions", fake_sweep)
+    cli._menu_list_sessions("claude", bypass=True)
+    assert swept == [["alpha", "beta"]]
+    assert state["renders"] == 2                 # redrawn after the sweep
+    assert state["focus"] == [None, "beta"]      # cursor stayed where it was
+    assert [s[1] for s in state["sessions"]] == ["beta"]
+
+
+# --- _pick_session key bindings ----------------------------------------------
+
+@pytest.fixture
+def pick_session_keys(monkeypatch, tmp_path):
+    """Drive the real card picker with piped keystrokes; return its (action, value)."""
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    choices = [
+        cli.questionary.Choice(title=f"repo/{n}", value=("repo", n, tmp_path / n))
+        for n in ("alpha", "beta")
+    ]
+    cards = [
+        {
+            "running": False, "title": None, "summary": None, "labels": [],
+            "branch": n, "dirty": False, "folder": f"repo/{n}",
+            "pr": None, "pr_pending": False, "when": "1d ago",
+        }
+        for n in ("alpha", "beta")
+    ]
+    real_select = cli.questionary.select
+
+    def drive(keys: str):
+        with create_pipe_input() as pipe:
+            pipe.send_text(keys)
+            monkeypatch.setattr(
+                cli.questionary, "select",
+                lambda *a, **k: real_select(*a, **k, input=pipe, output=DummyOutput()),
+            )
+            return cli._pick_session("Sessions", choices, cards)
+
+    return drive
+
+
+def test_pick_session_shift_x_sweeps_and_x_deletes(pick_session_keys):
+    # Same key, different case: one session vs. the whole stale batch.
+    assert pick_session_keys("x")[0] == "delete"
+    assert pick_session_keys("X")[0] == "sweep"
+    assert pick_session_keys("\r")[0] == "select"
+
+
+def test_pick_session_sweep_reports_the_pointed_at_session(pick_session_keys):
+    action, value = pick_session_keys("\x1b[BX")   # down, then Shift+X
+    assert (action, value[1]) == ("sweep", "beta")  # so the cursor can be restored
+
+
+# --- the stale sweep (Shift+X): which sessions qualify -----------------------
+
+_MERGED = {"number": 12, "state": "merged", "checks": "passing"}
+_OPEN = {"number": 13, "state": "open", "checks": "passing"}
+
+
+@pytest.fixture
+def stale_env(monkeypatch, tmp_path):
+    """Stub the git questions `_classify_stale` asks; return a classify() helper."""
+    git = {"dirty": False, "unpushed": 0, "ahead": 0, "error": False}
+
+    def _guard():
+        if git["error"]:
+            raise cli.git_ops.GitError("boom")
+
+    monkeypatch.setattr(cli.git_ops, "is_dirty", lambda p: (_guard(), git["dirty"])[1])
+    monkeypatch.setattr(cli.git_ops, "unpushed_count", lambda p: (_guard(), git["unpushed"])[1])
+    monkeypatch.setattr(cli.git_ops, "default_start_ref", lambda ws: "origin/main")
+    monkeypatch.setattr(cli.git_ops, "commits_ahead", lambda p, base: git["ahead"])
+
+    def classify(*, pr_info=None, live=(), **state):
+        git.update(state)
+        return cli._classify_stale(
+            "repo", "falcon", tmp_path / "falcon", set(live), {("repo", "falcon"): pr_info}
+        )
+
+    return classify
+
+
+def test_untouched_session_is_stale(stale_env):
+    stale = stale_env()
+    assert stale is not None
+    assert stale.reason == "no local changes"
+    assert stale.risks == []
+
+
+def test_untouched_but_running_session_is_left_alone(stale_env):
+    assert stale_env(live=["falcon"]) is None      # the one you just opened
+
+
+def test_session_with_its_own_commits_is_not_stale(stale_env):
+    assert stale_env(ahead=2) is None              # pushed work, no merged PR
+    assert stale_env(ahead=2, pr_info=_OPEN) is None   # under review
+
+
+def test_dirty_session_is_not_stale(stale_env):
+    assert stale_env(dirty=True) is None
+    assert stale_env(unpushed=1) is None
+
+
+def test_uncommitted_changes_veto_even_a_merged_pr(stale_env):
+    # The tree exists nowhere else — a merged PR doesn't make it safe to bin.
+    assert stale_env(ahead=3, dirty=True, pr_info=_MERGED) is None
+
+
+def test_merged_pr_makes_a_session_stale(stale_env):
+    stale = stale_env(ahead=3, pr_info=_MERGED)
+    assert stale is not None
+    assert stale.reason == "PR #12 merged"
+    assert stale.risks == []
+
+
+def test_merged_pr_reports_what_would_still_be_lost(stale_env):
+    stale = stale_env(ahead=3, unpushed=2, pr_info=_MERGED, live=["falcon"])
+    assert stale is not None                      # merged wins, but the cost is shown
+    assert stale.risks == [
+        "2 commits not pushed to any remote",
+        "session is running",
+    ]
+
+
+def test_unreadable_session_is_skipped(stale_env):
+    assert stale_env(error=True) is None           # can't vouch for it
+    assert stale_env(error=True, pr_info=_MERGED) is None
+
+
+def test_chat_sessions_are_never_swept(tmp_path):
+    assert cli._classify_stale(cli.CHATS, "falcon", tmp_path, set(), {}) is None
+
+
+# --- the stale sweep: listing, confirming, deleting in batch ------------------
+
+@pytest.fixture
+def sweep_harness(monkeypatch, tmp_path):
+    """Run `_sweep_stale_sessions` over canned candidates; record what it removed."""
+    state: dict = {"removed": [], "confirms": [], "fail": set()}
+
+    def configure(names, *, confirm=True, fail=()):
+        worktrees = [("repo", n, tmp_path / n) for n in names]
+        state["fail"] = set(fail)
+
+        monkeypatch.setattr(cli, "_resolve_pr_status", lambda wts: {})
+        monkeypatch.setattr(
+            cli, "_classify_stale",
+            lambda repo, name, path, live, statuses: cli._Stale(
+                repo, name, path, "no local changes", []
+            ),
+        )
+
+        def fake_remove(repo, name, path, live):
+            if name in state["fail"]:
+                raise cli.git_ops.GitError("worktree is locked")
+            state["removed"].append(name)
+
+        monkeypatch.setattr(cli, "_remove_session", fake_remove)
+
+        def fake_confirm(*args, **kwargs):
+            state["confirms"].append(args[0] if args else "")
+            return _Answer(confirm)
+
+        monkeypatch.setattr(cli.questionary, "confirm", fake_confirm)
+        return worktrees, state
+
+    return configure
+
+
+def test_sweep_lists_then_deletes_the_whole_batch(sweep_harness, capsys):
+    worktrees, state = sweep_harness(["alpha", "beta", "gamma"])
+    assert cli._sweep_stale_sessions(worktrees, set(), {}) == 3
+    out = capsys.readouterr().out
+    assert "3 of 3 sessions look stale" in out     # shown before anything happens
+    for name in ("alpha", "beta", "gamma"):
+        assert f"repo/{name}" in out
+    assert len(state["confirms"]) == 1             # one confirmation for the batch
+    assert state["removed"] == ["alpha", "beta", "gamma"]
+
+
+def test_sweep_deletes_nothing_when_declined(sweep_harness):
+    worktrees, state = sweep_harness(["alpha", "beta"], confirm=False)
+    assert cli._sweep_stale_sessions(worktrees, set(), {}) == 0
+    assert state["removed"] == []
+
+
+def test_sweep_with_no_candidates_asks_nothing(sweep_harness, monkeypatch, capsys):
+    worktrees, state = sweep_harness(["alpha"])
+    monkeypatch.setattr(cli, "_classify_stale", lambda *a, **k: None)
+    assert cli._sweep_stale_sessions(worktrees, set(), {}) == 0
+    assert state["confirms"] == []
+    assert "Nothing looks stale" in capsys.readouterr().out
+
+
+def test_sweep_carries_on_past_a_failed_removal(sweep_harness, capsys):
+    worktrees, state = sweep_harness(["alpha", "beta", "gamma"], fail=["beta"])
+    assert cli._sweep_stale_sessions(worktrees, set(), {}) == 2
+    assert state["removed"] == ["alpha", "gamma"]  # beta's failure didn't stop it
+    out = capsys.readouterr().out
+    assert "kept repo/beta" in out
+    assert "Deleted 2 of 3" in out
+
+
+def test_sweep_shows_each_session_headline(sweep_harness, capsys):
+    worktrees, _state = sweep_harness(["alpha"])
+    cards = {("repo", "alpha"): {"title": "Fix the login redirect"}}
+    cli._sweep_stale_sessions(worktrees, set(), cards)
+    assert "Fix the login redirect" in capsys.readouterr().out
+
+
+def test_stale_headline_falls_back_to_the_summary_and_shortens():
+    assert cli._stale_headline({"summary": "wired up the parser"}) == "wired up the parser"
+    assert cli._stale_headline({"title": "t", "summary": "s"}) == "t"
+    assert cli._stale_headline(None) == ""
+    assert cli._stale_headline({}) == ""
+    assert cli._stale_headline({"title": "word " * 40}).endswith("…")
+
+
 # --- _delete_repo (delete a whole cloned repo + its worktrees) ---------------
 
 @pytest.fixture
@@ -280,6 +633,54 @@ def test_delete_repo_with_no_worktrees_still_confirms(repo_delete_harness):
     cli._delete_repo("repo")
     assert len(calls["confirms"]) == 1
     assert not workspace.exists()
+
+
+# --- new worktree sessions branch off the latest remote ----------------------
+
+@pytest.fixture
+def new_session_env(monkeypatch, tmp_path, remote_repo):
+    """A clone of `remote_repo` plus a `start()` that sessions it.
+
+    Real git throughout (the point is what the worktree is cut from); only
+    tmux/attach and the name picker are stubbed. `start()` returns the path of
+    the worktree `_new_worktree_session` created.
+    """
+    monkeypatch.setenv("WORKSPACES_DIR", str(tmp_path / "ws"))
+    monkeypatch.setenv("WORKTREES_DIR", str(tmp_path / "wt"))
+    workspace = tmp_path / "ws" / "repo"
+    cli.git_ops.clone(str(remote_repo), workspace)
+
+    monkeypatch.setattr(cli.tmux_ops, "list_sessions", lambda *_a, **_k: [])
+    monkeypatch.setattr(cli.names, "random_name", lambda _taken: "falcon")
+    monkeypatch.setattr(cli, "_resume_worktree", lambda *a, **k: None)
+
+    def start():
+        cli._new_worktree_session("repo", workspace, "claude", bypass=True)
+        return tmp_path / "wt" / "repo" / "falcon"
+
+    return start
+
+
+def test_new_session_branches_off_the_latest_remote_commit(
+    new_session_env, remote_repo, git
+):
+    # The remote moves on after the clone: without a fetch the session would be
+    # cut from a stale origin/main and need a manual fast-forward later.
+    (remote_repo / "NEW.md").write_text("later\n")
+    git("add", "-A", cwd=remote_repo)
+    git("commit", "-q", "-m", "later", cwd=remote_repo)
+
+    worktree = new_session_env()
+    assert (worktree / "NEW.md").exists()
+
+
+def test_new_session_survives_an_unreachable_remote(new_session_env, monkeypatch):
+    def boom(_workspace):
+        raise cli.git_ops.GitError("no route to host")
+
+    monkeypatch.setattr(cli.git_ops, "fetch", boom)
+    worktree = new_session_env()          # branched off the refs already on disk
+    assert (worktree / "README.md").exists()
 
 
 # --- _resume_worktree bypass mode -------------------------------------------

@@ -68,6 +68,18 @@ def test_default_start_ref_uses_origin_head_after_clone(remote_repo, tmp_path):
     assert git_ops.default_start_ref(clone) == "origin/main"
 
 
+def test_default_start_ref_falls_back_to_upstream_without_origin_head(remote_repo, tmp_path):
+    # Some clones never get an origin/HEAD; the branch's upstream is still a
+    # remote-tracking ref, so it (unlike local HEAD) reflects the last fetch.
+    clone = tmp_path / "clone"
+    git_ops.clone(str(remote_repo), clone)
+    subprocess.run(
+        ["git", "-C", str(clone), "symbolic-ref", "-d", "refs/remotes/origin/HEAD"],
+        check=True,
+    )
+    assert git_ops.default_start_ref(clone) == "origin/main"
+
+
 def test_default_start_ref_falls_back_to_head_without_origin(remote_repo):
     # remote_repo has commits but no remote, so origin/HEAD is unresolvable.
     assert git_ops.default_start_ref(remote_repo) == "HEAD"
@@ -186,6 +198,31 @@ def test_unpushed_count_counts_local_commits(worktree, git):
         git("add", "-A", cwd=wt)
         git("commit", "-q", "-m", f"work {n}", cwd=wt)
     assert git_ops.unpushed_count(wt) == 2
+
+
+def test_commits_ahead_zero_on_a_fresh_worktree(worktree):
+    _, wt = worktree
+    assert git_ops.commits_ahead(wt, "origin/main") == 0
+
+
+def test_commits_ahead_counts_the_branch_own_commits(worktree, git):
+    _, wt = worktree
+    for n in (1, 2):
+        (wt / f"file{n}.txt").write_text("x\n")
+        git("add", "-A", cwd=wt)
+        git("commit", "-q", "-m", f"work {n}", cwd=wt)
+    assert git_ops.commits_ahead(wt, "origin/main") == 2
+
+
+def test_commits_ahead_still_counts_pushed_commits(worktree, git, remote_repo):
+    """Unlike `unpushed_count`, pushing doesn't hide the branch's own work."""
+    _, wt = worktree
+    (wt / "file.txt").write_text("x\n")
+    git("add", "-A", cwd=wt)
+    git("commit", "-q", "-m", "work", cwd=wt)
+    git("push", "-q", "-u", "origin", "falcon", cwd=wt)
+    assert git_ops.unpushed_count(wt) == 0
+    assert git_ops.commits_ahead(wt, "origin/main") == 1
 
 
 def test_remove_worktree_deletes_a_clean_worktree(worktree):

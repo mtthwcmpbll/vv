@@ -40,6 +40,10 @@ CHATS = "_chats"
 # shortcut instead of selecting a repo to start a session from.
 _DELETE = object()
 
+# Sentinel returned by the session picker when the user pressed the bulk-cleanup
+# shortcut (Shift+X) instead of picking a single session to act on.
+_SWEEP = object()
+
 
 def _fail(message: str) -> "typer.Exit":
     """Print an error and return an Exit to raise."""
@@ -195,6 +199,18 @@ def _new_worktree_session(
         raise _fail(f"session '{name}' already exists")
     worktree_path = worktree_root / name
 
+    # Branch off the *latest* remote state, not whatever the clone last saw.
+    # Every create flow lands here, so the fetch belongs here rather than in
+    # any one of them: a session cut from a stale origin/main starts behind and
+    # has to be caught up by hand later. Best-effort — an unreachable remote is
+    # no reason to refuse to make a session, it just means branching off the
+    # refs already on disk.
+    typer.secho(f"Fetching latest for '{repo_name}'...", fg=typer.colors.CYAN)
+    try:
+        git_ops.fetch(workspace)
+    except git_ops.GitError as exc:
+        typer.secho(f"  (fetch failed, continuing: {exc})", fg=typer.colors.YELLOW)
+
     start_ref = git_ops.default_start_ref(workspace)
     typer.secho(
         f"Creating worktree '{name}' (branch off {start_ref})...",
@@ -275,11 +291,8 @@ def _start_from_url(
     workspace = config.workspaces_dir() / repo_name
 
     if workspace.exists():
-        typer.secho(f"Repo '{repo_name}' already cloned, fetching latest...", fg=typer.colors.CYAN)
-        try:
-            git_ops.fetch(workspace)
-        except git_ops.GitError as exc:
-            typer.secho(f"  (fetch failed, continuing: {exc})", fg=typer.colors.YELLOW)
+        # No fetch here — _new_worktree_session fetches for every create flow.
+        typer.secho(f"Repo '{repo_name}' already cloned.", fg=typer.colors.CYAN)
     else:
         typer.secho(f"Cloning '{repo_name}'...", fg=typer.colors.CYAN)
         git_ops.clone(repo_url, workspace)
@@ -372,8 +385,11 @@ def _resume_session(
     _resume_worktree(name, path, agent, bypass)
 
 
-def _delete_chat(name: str, path: Path, live: set[str]) -> None:
-    """Delete a chat session dir, warning first if it has any contents."""
+def _delete_chat(name: str, path: Path, live: set[str]) -> bool:
+    """Delete a chat session dir, warning first if it has any contents.
+
+    Returns whether it was deleted (``False`` when the user declined).
+    """
     if any(path.iterdir()):
         typer.secho(
             f"chat '{name}' has files in it that would be lost.",
@@ -384,30 +400,42 @@ def _delete_chat(name: str, path: Path, live: set[str]) -> None:
         ).ask()
         if not confirmed:
             typer.secho("Cancelled — chat kept.", fg=typer.colors.CYAN)
-            return
+            return False
 
+    _remove_session(CHATS, name, path, live)
+    typer.secho(f"Deleted chat '{name}'.", fg=typer.colors.GREEN)
+    return True
+
+
+def _remove_session(repo: str, name: str, path: Path, live: set[str]) -> None:
+    """Tear a session down — tmux session, worktree/dir, branch, notes. No prompts.
+
+    The mechanics only: the caller owns the warning and confirmation (per-session
+    in :func:`_delete_session`, once for the whole batch in
+    :func:`_sweep_stale_sessions`). Raises :class:`git_ops.GitError` on a failed
+    git step.
+    """
+    # The session's working directory is about to vanish; close it first.
     if name in live:
         tmux_ops.kill_session(name)
-    shutil.rmtree(path)
-    notes.forget(CHATS, name)
-    typer.secho(f"Deleted chat '{name}'.", fg=typer.colors.GREEN)
+    if repo == CHATS:
+        shutil.rmtree(path)
+    else:
+        workspace = config.workspaces_dir() / repo
+        git_ops.remove_worktree(workspace, path, force=True)
+        git_ops.delete_branch(workspace, name, force=True)
+    notes.forget(repo, name)
 
 
-def _delete_session(repo: str, name: str, path: Path, live: set[str]) -> None:
-    """Delete a session, warning first if it holds work that would be lost."""
+def _delete_session(repo: str, name: str, path: Path, live: set[str]) -> bool:
+    """Delete a session, warning first if it holds work that would be lost.
+
+    Returns whether it was deleted (``False`` when the user declined).
+    """
     if repo == CHATS:
         return _delete_chat(name, path, live)
 
-    workspace = config.workspaces_dir() / repo
-
-    risks: list[str] = []
-    if git_ops.is_dirty(path):
-        risks.append("uncommitted changes in the working tree")
-    unpushed = git_ops.unpushed_count(path)
-    if unpushed:
-        plural = "" if unpushed == 1 else "s"
-        risks.append(f"{unpushed} commit{plural} not pushed to any remote")
-
+    risks = _work_at_risk(path)
     if risks:
         typer.secho(f"'{repo}/{name}' has work that would be lost:", fg=typer.colors.YELLOW)
         for risk in risks:
@@ -417,15 +445,28 @@ def _delete_session(repo: str, name: str, path: Path, live: set[str]) -> None:
         ).ask()
         if not confirmed:
             typer.secho("Cancelled — worktree kept.", fg=typer.colors.CYAN)
-            return
+            return False
 
-    # The session's working directory is about to vanish; close it first.
-    if name in live:
-        tmux_ops.kill_session(name)
-    git_ops.remove_worktree(workspace, path, force=True)
-    git_ops.delete_branch(workspace, name, force=True)
-    notes.forget(repo, name)
+    _remove_session(repo, name, path, live)
     typer.secho(f"Deleted worktree '{repo}/{name}'.", fg=typer.colors.GREEN)
+    return True
+
+
+def _work_at_risk(path: Path) -> list[str]:
+    """Describe the work in a git session that deleting it would lose.
+
+    Empty when there is nothing uncommitted and nothing unpushed. Raises
+    :class:`git_ops.GitError` if the session can't be inspected — callers must
+    decide what an unknown state means (a delete asks, the sweep skips).
+    """
+    risks: list[str] = []
+    if git_ops.is_dirty(path):
+        risks.append("uncommitted changes in the working tree")
+    unpushed = git_ops.unpushed_count(path)
+    if unpushed:
+        plural = "" if unpushed == 1 else "s"
+        risks.append(f"{unpushed} commit{plural} not pushed to any remote")
+    return risks
 
 
 def _session_from_cwd() -> tuple[str, str, Path] | None:
@@ -560,65 +601,286 @@ def _session_summaries(
 
 
 def _menu_list_sessions(default_agent: str, bypass: bool) -> None:
-    """List existing worktrees as cards; resume or delete the chosen one."""
-    worktrees = _list_worktrees()
-    if not worktrees:
+    """List existing worktrees as cards; resume or delete the chosen one.
+
+    A delete **loops back** to the freshly-rebuilt list instead of leaving the
+    menu, so a run of stale sessions can be cleaned up in one visit; the cursor
+    lands on the session that took the deleted one's place. **Shift+X** sweeps
+    every stale session at once (:func:`_sweep_stale_sessions`) and also loops
+    back. Resuming or cancelling still leaves.
+    """
+    focus: tuple[str, str] | None = None  # session to point at on re-entry
+    deleted_any = False
+    while True:
+        worktrees = _list_worktrees()
+        if not worktrees:
+            if deleted_any:
+                typer.secho("No sessions left.", fg=typer.colors.CYAN)
+            else:
+                typer.secho(
+                    "No worktrees yet. Choose a repo to start one.",
+                    fg=typer.colors.YELLOW,
+                )
+            return
+        live = set(tmux_ops.list_sessions())
+        summaries = _session_summaries(default_agent, worktrees)
+
+        # PR status: serve whatever is cached instantly, then refresh the rest in
+        # the background while the menu is open (see `_pick_session`), so opening
+        # the view never blocks on `gh`.
+        session_paths = {(repo, name): path for repo, name, path in worktrees}
+        pr_snapshot = pr.Snapshot(session_paths)
+        pr_cached = pr_snapshot.cached
+        pr_stale = pr_snapshot.stale_keys
+
+        note_store = notes.all_notes()
+
+        cards: list[dict] = []
+        choices: list[questionary.Choice] = []
+        card_by_key: dict[tuple[str, str], dict] = {}
+        for repo, name, path in worktrees:
+            is_git = (path / ".git").exists()
+            key = (repo, name)
+            note = note_store.get(notes.session_id(repo, name), notes.Note())
+            card = {
+                "running": name in live,
+                "title": note.title,          # user-set; sits above the summary
+                "summary": summaries.get(key),
+                "labels": note.labels,
+                "branch": name if is_git else None,  # vv's worktree branch is its name
+                "dirty": _worktree_dirty(path) if is_git else False,
+                "folder": f"{repo}/{name}",
+                "pr": pr_cached.get(key),
+                "pr_pending": key in pr_stale,  # awaiting a background refresh
+                "when": _relative_time(_created_ts(path)),
+            }
+            cards.append(card)
+            card_by_key[key] = card
+            choices.append(questionary.Choice(title=f"{repo}/{name}", value=(repo, name, path)))
+
+        action, value = _pick_session(
+            "Sessions  ·  enter to resume · x to delete · X to clean up stale",
+            choices,
+            cards,
+            pr_snapshot,
+            card_by_key,
+            _card_theme(),
+            focus=_focus_value(choices, focus),
+        )
+        if action == "cancel":
+            return
+        repo, name, path = value
+        if action == "sweep":
+            # Whatever the sweep took, the cursor tries to stay where it was; a
+            # swept-away session just falls back to the top of the rebuilt list.
+            focus = (repo, name)
+            if _sweep_stale_sessions(worktrees, live, card_by_key):
+                deleted_any = True
+            continue
+        if action != "delete":
+            _resume_session(name, path, default_agent, live, bypass)
+            return
+
+        order = [(r, n) for r, n, _ in worktrees]
+        if _delete_session(repo, name, path, live):
+            deleted_any = True
+            focus = _next_focus(order, (repo, name))
+        else:
+            focus = (repo, name)  # kept — stay on it
+
+
+def _focus_value(choices: list, focus: tuple[str, str] | None) -> object | None:
+    """Map a ``(repo, name)`` key to the matching choice value, if it is still there."""
+    if focus is None:
+        return None
+    return next((c.value for c in choices if (c.value[0], c.value[1]) == focus), None)
+
+
+def _next_focus(
+    order: list[tuple[str, str]], removed: tuple[str, str]
+) -> tuple[str, str] | None:
+    """The session the cursor should land on after ``removed`` is deleted.
+
+    Prefers the one below it (which slides up into its slot), else the one above,
+    else nothing — the same feel as deleting a line in an editor.
+    """
+    try:
+        index = order.index(removed)
+    except ValueError:
+        return None
+    if index + 1 < len(order):
+        return order[index + 1]
+    if index:
+        return order[index - 1]
+    return None
+
+
+# --- bulk cleanup of stale sessions (Shift+X) --------------------------------
+
+#: Why a session was picked up by the sweep. A merged PR means the work landed;
+#: "untouched" means the branch never diverged from where it was cut and has
+#: nothing uncommitted — there is nothing in it to lose either way.
+_REASON_MERGED = "PR #{number} merged"
+_REASON_UNTOUCHED = "no local changes"
+
+
+@dataclass
+class _Stale:
+    """A session the sweep proposes deleting, with why and what it would cost."""
+
+    repo: str
+    name: str
+    path: Path
+    reason: str
+    #: Work that would still be lost (a merged PR can sit on unpushed commits),
+    #: plus "session is running" — shown so the confirmation is informed.
+    risks: list[str]
+
+    @property
+    def key(self) -> tuple[str, str]:
+        return self.repo, self.name
+
+
+def _sweep_stale_sessions(
+    worktrees: list[tuple[str, str, Path]], live: set[str], card_by_key: dict
+) -> int:
+    """Find every stale session, list it for review, and delete the lot on confirm.
+
+    "Stale" is :func:`_classify_stale`: a merged PR, or a branch with no local
+    changes at all — never one with an uncommitted working tree. The list is
+    printed first — with each session's headline and
+    anything that would still be lost — and nothing is touched until a single
+    confirmation covers the whole batch. Returns how many were deleted.
+    """
+    statuses = _resolve_pr_status(worktrees)
+    candidates = [
+        stale
+        for repo, name, path in worktrees
+        if (stale := _classify_stale(repo, name, path, live, statuses)) is not None
+    ]
+    if not candidates:
         typer.secho(
-            "No worktrees yet. Choose a repo to start one.",
+            "Nothing looks stale — every session has work in it or a PR still open.",
+            fg=typer.colors.CYAN,
+        )
+        return 0
+
+    typer.secho(
+        f"\n{len(candidates)} of {len(worktrees)} sessions look stale:",
+        fg=typer.colors.YELLOW,
+        bold=True,
+    )
+    for stale in candidates:
+        typer.secho(f"  {stale.repo}/{stale.name}", fg=typer.colors.WHITE, bold=True, nl=False)
+        typer.secho(f"  ·  {stale.reason}", fg=typer.colors.GREEN, nl=False)
+        typer.secho(
+            f"  ·  {', '.join(stale.risks)}" if stale.risks else "",
             fg=typer.colors.YELLOW,
         )
-        return
-    live = set(tmux_ops.list_sessions())
-    summaries = _session_summaries(default_agent, worktrees)
+        headline = _stale_headline(card_by_key.get(stale.key))
+        if headline:
+            typer.secho(f"      {headline}", fg=typer.colors.BRIGHT_BLACK)
+    typer.echo()
 
-    # PR status: serve whatever is cached instantly, then refresh the rest in the
-    # background while the menu is open (see `_pick_session`), so opening the view
-    # never blocks on `gh`.
-    session_paths = {(repo, name): path for repo, name, path in worktrees}
-    pr_snapshot = pr.Snapshot(session_paths)
-    pr_cached = pr_snapshot.cached
-    pr_stale = pr_snapshot.stale_keys
+    confirmed = questionary.confirm(
+        f"Delete all {len(candidates)} of them? This cannot be undone.", default=False
+    ).ask()
+    if not confirmed:
+        typer.secho("Cancelled — nothing deleted.", fg=typer.colors.CYAN)
+        return 0
 
-    note_store = notes.all_notes()
-
-    cards: list[dict] = []
-    choices: list[questionary.Choice] = []
-    card_by_key: dict[tuple[str, str], dict] = {}
-    for repo, name, path in worktrees:
-        is_git = (path / ".git").exists()
-        key = (repo, name)
-        note = note_store.get(notes.session_id(repo, name), notes.Note())
-        card = {
-            "running": name in live,
-            "title": note.title,          # user-set; sits above the summary
-            "summary": summaries.get(key),
-            "labels": note.labels,
-            "branch": name if is_git else None,  # vv's worktree branch is its name
-            "dirty": _worktree_dirty(path) if is_git else False,
-            "folder": f"{repo}/{name}",
-            "pr": pr_cached.get(key),
-            "pr_pending": key in pr_stale,  # awaiting a background refresh
-            "when": _relative_time(_created_ts(path)),
-        }
-        cards.append(card)
-        card_by_key[key] = card
-        choices.append(questionary.Choice(title=f"{repo}/{name}", value=(repo, name, path)))
-
-    action, value = _pick_session(
-        "Sessions  ·  enter to resume · x to delete",
-        choices,
-        cards,
-        pr_snapshot,
-        card_by_key,
-        _card_theme(),
+    deleted = 0
+    for stale in candidates:
+        try:
+            _remove_session(stale.repo, stale.name, stale.path, live)
+        except (git_ops.GitError, tmux_ops.TmuxError, OSError) as exc:
+            # One stubborn session mustn't strand the rest of the batch.
+            typer.secho(f"  ! kept {stale.repo}/{stale.name}: {exc}", fg=typer.colors.RED)
+            continue
+        deleted += 1
+    typer.secho(
+        f"Deleted {deleted} of {len(candidates)} stale sessions.", fg=typer.colors.GREEN
     )
-    if action == "cancel":
-        return
-    repo, name, path = value
-    if action == "delete":
-        _delete_session(repo, name, path, live)
-    else:
-        _resume_session(name, path, default_agent, live, bypass)
+    return deleted
+
+
+def _classify_stale(
+    repo: str, name: str, path: Path, live: set[str], statuses: dict
+) -> _Stale | None:
+    """Return why this session is stale, or ``None`` to leave it alone.
+
+    Two reasons, both meaning "nothing here is waiting on you":
+
+    * its **PR is merged** — the work landed, so the branch has served its purpose
+      (still reported with anything unpushed left behind, since a merged PR says
+      nothing about commits that never went up);
+    * it has **no local changes** — clean working tree, nothing unpushed, and no
+      commits of its own beyond where the branch was cut.
+
+    An **uncommitted working tree vetoes both**: those changes exist nowhere else,
+    so no amount of merged-PR evidence makes them safe to bin. Such a session is
+    never proposed in bulk — it can still be deleted one at a time through
+    :func:`_delete_session`, where the warning names what is being lost.
+
+    Deliberately conservative everywhere else: chats are never swept (no branch
+    and no PR to judge them by), a session that is *running* is never swept for
+    being untouched (that is the one you just opened), an open PR keeps its
+    session no matter how clean it is (that work is under review), and a session
+    git can't answer for is skipped rather than assumed empty.
+    """
+    if repo == CHATS:
+        return None
+    pr_info = statuses.get((repo, name))
+    merged = bool(pr_info) and pr_info.get("state") == "merged"
+
+    try:
+        if git_ops.is_dirty(path):
+            return None  # uncommitted work is unrecoverable -> never swept
+        risks = _work_at_risk(path)
+        untouched = not risks and _commits_ahead(repo, path) == 0
+    except git_ops.GitError:
+        return None  # can't vouch for it -> don't offer it up
+
+    if merged:
+        if name in live:
+            risks = [*risks, "session is running"]
+        return _Stale(repo, name, path, _REASON_MERGED.format(number=pr_info["number"]), risks)
+    if untouched and name not in live:
+        return _Stale(repo, name, path, _REASON_UNTOUCHED, [])
+    return None
+
+
+def _commits_ahead(repo: str, path: Path) -> int:
+    """Commits on the session's branch that its repo's default branch doesn't have."""
+    base = git_ops.default_start_ref(config.workspaces_dir() / repo)
+    return git_ops.commits_ahead(path, base)
+
+
+def _resolve_pr_status(worktrees: list[tuple[str, str, Path]]) -> dict:
+    """PR status for every git session, fetching what the cache doesn't know.
+
+    The cards' background refresh is best-effort and may not have landed (or may
+    have been cut short when the menu closed), and treating an unknown PR as "not
+    merged" would silently under-clean. So the sweep blocks on the fetch — the one
+    place in vv where waiting on ``gh`` is the right trade.
+    """
+    snapshot = pr.Snapshot({(repo, name): path for repo, name, path in worktrees})
+    statuses = dict(snapshot.cached)
+    pending = snapshot.stale_keys
+    if pending:
+        typer.secho(
+            f"Checking {len(pending)} session(s) for merged PRs…", fg=typer.colors.CYAN
+        )
+        snapshot.refresh(lambda key, pr_info: statuses.__setitem__(key, pr_info)).join()
+    return statuses
+
+
+def _stale_headline(card: dict | None) -> str:
+    """The card's title (else its summary), trimmed to one short line for the list."""
+    if not card:
+        return ""
+    text = (card.get("title") or card.get("summary") or "").strip()
+    return textwrap.shorten(text, width=64, placeholder="…") if text else ""
 
 
 # --- session cards ----------------------------------------------------------
@@ -953,6 +1215,7 @@ def _pick_session(
     pr_snapshot: "pr.Snapshot | None" = None,
     card_by_key: dict | None = None,
     theme: "CardTheme | None" = None,
+    focus: object | None = None,
 ) -> tuple[str, object]:
     """Show the session list as cards; return ``(action, value)`` like :func:`_pick_with_delete`.
 
@@ -968,12 +1231,24 @@ def _pick_session(
     ``pr`` is updated and the app is repainted (``app.invalidate()`` is thread
     safe). The menu stays fully responsive throughout; a ``stop`` event ends the
     refresh callbacks the moment the user leaves the view.
+
+    ``focus`` is a choice value to start the cursor on (questionary's ``default``),
+    which keeps the cursor in place when the view is re-entered after a delete.
+
+    Three actions come back: ``"select"`` (Enter), ``"delete"`` (``x``, the
+    pointed-at session) and ``"sweep"`` (``X``, bulk-clean the stale ones — it
+    still reports the pointed-at session so the caller can restore the cursor).
     """
     from questionary.prompts.common import InquirerControl
 
     theme = theme or _DEFAULT_THEME
     question = questionary.select(
-        message, choices=choices, style=_card_style(theme), pointer=None, instruction=" "
+        message,
+        choices=choices,
+        style=_card_style(theme),
+        pointer=None,
+        instruction=" ",
+        default=focus,
     )
     control = next(
         c
@@ -987,6 +1262,10 @@ def _pick_session(
     @question.application.key_bindings.add("x", eager=True)
     def _request_delete(event) -> None:
         event.app.exit(result=(_DELETE, control.get_pointed_at().value))
+
+    @question.application.key_bindings.add("X", eager=True)
+    def _request_sweep(event) -> None:
+        event.app.exit(result=(_SWEEP, control.get_pointed_at().value))
 
     stop = threading.Event()
     if pr_snapshot is not None and card_by_key is not None:
@@ -1011,6 +1290,8 @@ def _pick_session(
         return "cancel", None
     if isinstance(answer, tuple) and answer[0] is _DELETE:
         return "delete", answer[1]
+    if isinstance(answer, tuple) and answer[0] is _SWEEP:
+        return "sweep", answer[1]
     return "select", answer
 
 
