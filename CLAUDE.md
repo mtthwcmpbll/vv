@@ -66,6 +66,10 @@ A fifth flow starts no session at all: **`vv --title TEXT`** (`-t`) /
 **`vv --label TAG`** (`-l`) → `cli._apply_notes()` annotates an *existing*
 session and exits (see "Session notes" below).
 
+A sixth likewise starts nothing: **`vv --skills`** → `cli._install_skills()`
+copies vv's bundled agent skills into every agent tool on this machine and exits
+(see "Bundled skills" below).
+
 `_menu_add_repo()` shows a scrollable `questionary.select` of every GitHub repo
 the user can access (`_pick_github_repo()`) when `gh_ops.is_available()` (gh on PATH
 and logged in). Typing filters the `owner/name` list by **substring**
@@ -104,10 +108,10 @@ the clone lands on an unborn HEAD and vv's empty-repo bootstrap seeds a root com
 that diverges from the content arriving behind it. A poll timeout warns and
 continues rather than hanging.
 
-`_new_worktree_session()` picks a random collision-free word
-(`names.random_name()`, excluding existing tmux sessions, git branches, and
-worktree dirs), creates a worktree on a new branch of that name off the remote
-default branch, then calls `_resume_worktree()`. It **fetches first**
+`_new_worktree_session()` picks a random collision-free
+`<adjective>-<animal>` name (`names.random_name()`, excluding existing tmux
+sessions, git branches, and worktree dirs), creates a worktree on a new branch
+of that name off the remote default branch, then calls `_resume_worktree()`. It **fetches first**
 (`git_ops.fetch()`), for every create flow rather than in any one of them: a
 session cut from a stale `origin/main` starts behind and has to be caught up by
 hand later, and the menu's "new session from an existing repo" path in
@@ -169,7 +173,9 @@ and in the quieter `card.summary` style, so a card can carry both. Then — when
 the session has any — a row of `#label` chips indented the same way (both from
 `notes.all_notes()`; chips are joined by the `label_gap` glyph and wrapped like
 the headline, and each row is omitted entirely when empty), then a
-`branch [*] · repo/name` line (the `*`, from `_worktree_dirty()`,
+`branch [*] · repo/name` line (the branch from `_session_branch()`, *asked of
+git* rather than assumed to be the session name — see "The branch is not the
+session name" below; the `*`, from `_worktree_dirty()`,
 flags uncommitted/unpushed work; no leading glyph — an uncommon symbol like `⎇`
 renders wide on some phone fonts and clips the branch name), then a color-coded
 PR-status line with a right-aligned relative timestamp (`_relative_time()`). Cards
@@ -223,7 +229,9 @@ either flags work that would be lost it requires a `questionary.confirm()` befor
 proceeding. The mechanics then live in `_remove_session()` — kill any live tmux
 session, `git_ops.remove_worktree(force=True)` +
 `git_ops.delete_branch(force=True)` (so a deleted worktree frees its name for
-reuse), `notes.forget()` — deliberately **prompt-free**, because the batch sweep
+reuse) — on the branch `_session_branch()` reports, read **before** the worktree
+is removed (git can't be run in it afterwards) and falling back to the session
+name — `notes.forget()` — deliberately **prompt-free**, because the batch sweep
 confirms once for many sessions and must not re-ask per session. Chat sessions
 branch through `_delete_chat()` for their warning (no git ops, but the user is
 still warned if the directory is non-empty) and `_remove_session()` `rmtree`s
@@ -316,6 +324,48 @@ leading `-` — or a title starting with one — can't be read as a flag by the
 remote's parser), but annotating an existing session is handled *locally and
 never launches a cmux tab* — inside a remote session you are already running the
 remote's own vv, whose config has no `[remote]`.
+
+### Bundled skills (`vv --skills`)
+
+vv ships agent skills under `vv/_skills/<name>/SKILL.md` — currently just `pr`,
+which commits, renames the branch to `<type>/<short-summary>`, pushes, and opens
+the PR. A skill is only useful once the agent can *see* it, and every agent looks
+somewhere different, so `vv --skills` installs them.
+
+The happy accident that makes this a copy rather than a translation: all five
+supported tools read personal skills from `<root>/skills/<name>/SKILL.md`
+(Anthropic's Agent Skills layout). Only the root differs, which is all
+`skills._ROOTS` records — Claude Code `~/.claude` (or `$CLAUDE_CONFIG_DIR`),
+Cursor `~/.cursor`, GitHub Copilot `~/.copilot`, Codex `~/.codex` (or
+`$CODEX_HOME`), and Antigravity **`~/.gemini/config`** — that last one is the
+non-obvious one: it is the only global location all three Antigravity flavors
+(IDE, CLI, agy) agree on, and its `~/.gemini/antigravity/` siblings are
+conversation state, not configuration. Roots resolve in `skills.targets()` at
+call time, not import, so `$HOME`/env changes (and tests) are seen.
+
+A tool counts as **found** when its root directory exists (`skills.discovered()`).
+vv creates the `skills/` directory under a found root but never the root itself:
+inventing `~/.codex` for someone who has never installed Codex would leave a
+stray config dir that tool would then have opinions about. Tools that aren't
+found are listed as skipped, not treated as an error.
+
+`skills.status()` is the three-way the flow turns on — `missing`, `same`, or
+`differs` — computed from a `_digest()` of the whole skill tree, not just
+`SKILL.md`, since skills may carry `scripts/` and `references/`. `differs` can't
+distinguish "stale copy from an older vv" from "the user edited it", so
+`_install_skills()` never silently overwrites: it lists every conflict and asks
+**once** (the stale sweep's "show the batch, confirm once" shape). Declining
+keeps those and still installs everywhere the skill is missing. `install()`
+`rmtree`s before copying rather than merging, so a file the skill has since
+dropped can't linger and keep the tree reading `differs`. Individual installs are
+wrapped, so an unwritable root reports `!` and the batch continues.
+
+Two placement details: the data dir is `vv/_skills/` and **not** `vv/skills/`,
+which would sit next to `vv/skills.py` and resolve only by the
+namespace-package tiebreak; and `--skills` is handled before mode resolution in
+`cli.main()`, so it never routes through remote mode — it configures *this*
+machine's tools, and inside a remote session you are already running the remote
+vv against the tools you actually want the skills in.
 
 ### Remote-launcher mode (cmux)
 
@@ -475,7 +525,18 @@ is verified; the others in `BYPASS_FLAGS` are best-guesses.
   `CmuxError`.
 - `remote.py` — remote-launcher orchestration: opens a `cmux ssh` workspace and
   `send`s the `bash -lc '<vv …>'` command into it; `gen_name()` helper.
-- `names.py` — curated single-word name list + collision-avoiding picker.
+- `skills.py` — installs the skills bundled in `vv/_skills/` into the agent tools
+  on this machine (see "Bundled skills"). `targets()` resolves every supported
+  tool's root, `discovered()` filters to the ones present, `bundled_skills()`
+  lists what vv ships, `status()` compares a skill's installed tree against the
+  bundled one, and `install()` copies it in. Pure filesystem work — it shells out
+  to nothing and knows nothing about the CLI's prompting.
+- `names.py` — two curated word pools (`ADJECTIVES` positive adjectives,
+  `ANIMALS`) combined into `<adjective>-<animal>` session names, plus the
+  collision-avoiding picker. `random_name()` draws a random pair (retrying a few
+  times), only enumerating `all_names()` — the full ~42k product — if the draws
+  keep colliding, and suffixes a number in the impossible case that every
+  combination is taken.
 - `cli.py` — Typer app, flow orchestration, interactive menu.
 
 ### Conventions to preserve
@@ -493,8 +554,19 @@ is verified; the others in `BYPASS_FLAGS` are best-guesses.
   token: `cmux send` unescapes `\n`/`\r`/`\t`, so it becomes the Enter that
   submits the line. Pass the command as a single token after `send … --` so its
   spaces/quotes aren't re-split. Don't hand-build these strings.
-- The worktree name is used as the branch name *and* tmux session name — keep
-  `names.WORDS` entries valid as both (no `.`, `:`, `/`, or spaces).
+- The worktree name seeds the branch name *and* is the tmux session name — keep
+  `names.ADJECTIVES` / `names.ANIMALS` entries valid as both (no `.`, `:`, `/`,
+  or spaces) and free of `-`, which separates the two halves.
+- **The branch is not the session name.** A session starts on a branch named
+  after its worktree, but nothing holds it there: a PR flow may `git branch -m`
+  it to something readable (`feat/session-cards`) so reviewers see intent rather
+  than `brave-falcon`. Anything that *shows* or *deletes* a session's branch must
+  therefore ask git — `cli._session_branch()`, which is best-effort and returns
+  `None` on a git error or a detached HEAD so callers can fall back to the
+  session name. The tmux session and worktree directory keep the original name
+  (a branch name may contain `/`, those may not), so the two legitimately
+  diverge. `_list_worktrees()`, name-collision avoidance, and the notes/summary/PR
+  cache keys are all keyed on the *session* name and are unaffected.
 - `tmux send-keys` targets must use the `=name:` form (trailing colon) for an
   exact-match session→pane target; `=name` alone fails with "can't find pane".
 - `attach()` uses `switch-client` when already inside tmux (`$TMUX` set) and

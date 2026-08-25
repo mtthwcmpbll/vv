@@ -66,6 +66,30 @@ session; otherwise pass `--name`. Titles and labels live in
 `WORKTREES_DIR/.session-notes.json` and are forgotten when the session is
 deleted.
 
+## Bundled skills
+
+`vv` ships a `pr` skill — commit, rename the branch to `<type>/<short-summary>`
+so the remote branch reads well, push, open the PR. `vv --skills` installs it
+into every supported agent tool it finds on your machine:
+
+```sh
+vv --skills
+```
+
+| Tool | Installed to |
+| --- | --- |
+| Claude Code | `~/.claude/skills/` (or `$CLAUDE_CONFIG_DIR`) |
+| Cursor | `~/.cursor/skills/` |
+| GitHub Copilot | `~/.copilot/skills/` |
+| Codex | `~/.codex/skills/` (or `$CODEX_HOME`) |
+| Antigravity | `~/.gemini/config/skills/` |
+
+A tool is only touched when its config directory already exists, so `vv` never
+invents config dirs for tools you don't use — the rest are listed as skipped.
+Re-running is safe: unchanged copies are left alone, and a copy you have edited
+is listed and confirmed before it gets overwritten. Restart a tool to pick up
+its new skills.
+
 ## Agent CLI
 
 `vv` launches `claude` by default, but any agentic CLI on your `PATH` works

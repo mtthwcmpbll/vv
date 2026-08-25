@@ -23,6 +23,7 @@ from . import (
     notes,
     pr,
     remote,
+    skills,
     summary,
     tmux_ops,
 )
@@ -422,8 +423,13 @@ def _remove_session(repo: str, name: str, path: Path, live: set[str]) -> None:
         shutil.rmtree(path)
     else:
         workspace = config.workspaces_dir() / repo
+        # Read the branch *before* the worktree vanishes: it may have been
+        # renamed since the session was created (a PR flow retitling it
+        # `feat/…`), and deleting by the worktree's name would then leave the
+        # real branch orphaned.
+        branch = _session_branch(path) or name
         git_ops.remove_worktree(workspace, path, force=True)
-        git_ops.delete_branch(workspace, name, force=True)
+        git_ops.delete_branch(workspace, branch, force=True)
     notes.forget(repo, name)
 
 
@@ -647,7 +653,9 @@ def _menu_list_sessions(default_agent: str, bypass: bool) -> None:
                 "title": note.title,          # user-set; sits above the summary
                 "summary": summaries.get(key),
                 "labels": note.labels,
-                "branch": name if is_git else None,  # vv's worktree branch is its name
+                # Ask git rather than assuming the session's name: a renamed
+                # branch is the readable one, and is what reviewers will see.
+                "branch": (_session_branch(path) or name) if is_git else None,
                 "dirty": _worktree_dirty(path) if is_git else False,
                 "folder": f"{repo}/{name}",
                 "pr": pr_cached.get(key),
@@ -713,6 +721,77 @@ def _next_focus(
     if index:
         return order[index - 1]
     return None
+
+
+# --- installing vv's bundled skills into the agent CLIs ----------------------
+
+
+def _install_skills() -> None:
+    """Install vv's bundled skills into every agent tool found on this machine.
+
+    Backs ``vv --skills``. Each tool reads skills from its own root but they all
+    use the same `<root>/skills/<name>/SKILL.md` layout, so this is a copy per
+    (skill, tool) pair. Tools whose config root is absent are simply not
+    installed here and are listed as skipped rather than treated as an error.
+
+    A copy that differs from the bundled one — an older vv's, or one edited in
+    place — is *not* silently overwritten: all of them are listed and confirmed
+    once, following the stale sweep's "show the batch, ask once" shape. Declining
+    keeps those and still installs everywhere the skill is missing.
+    """
+    bundled = skills.bundled_skills()
+    if not bundled:
+        raise _fail("this vv ships no skills to install")
+
+    found = skills.discovered()
+    if not found:
+        typer.secho("No supported agent tools found on this machine.", fg=typer.colors.YELLOW)
+        for target in skills.targets():
+            typer.secho(f"  looked in {target.root}", fg=typer.colors.BRIGHT_BLACK)
+        return
+
+    # Plan before touching anything, so the confirm below can describe the batch.
+    plan = [
+        (skill, target, skills.status(skill, target))
+        for skill in bundled
+        for target in found
+    ]
+    conflicts = [(skill, target) for skill, target, state in plan if state == "differs"]
+
+    overwrite = True
+    if conflicts:
+        typer.secho("Already installed, and different from vv's copy:", fg=typer.colors.YELLOW)
+        for skill, target in conflicts:
+            typer.secho(f"  {target.label}: {target.path_for(skill)}", fg=typer.colors.YELLOW)
+        overwrite = bool(
+            questionary.confirm("Overwrite these with vv's version?", default=False).ask()
+        )
+
+    installed = 0
+    for skill, target, state in plan:
+        if state == "same":
+            typer.secho(f"  = {target.label}: {skill} already up to date", fg=typer.colors.CYAN)
+            continue
+        if state == "differs" and not overwrite:
+            typer.secho(f"  - {target.label}: {skill} kept as-is", fg=typer.colors.YELLOW)
+            continue
+        try:
+            path = skills.install(skill, target)
+        except OSError as exc:  # a read-only or otherwise unwritable root
+            typer.secho(f"  ! {target.label}: {skill} failed — {exc}", fg=typer.colors.RED)
+            continue
+        verb = "updated" if state == "differs" else "installed"
+        typer.secho(f"  + {target.label}: {verb} {path}", fg=typer.colors.GREEN)
+        installed += 1
+
+    missing = [t.label for t in skills.targets() if t not in found]
+    if missing:
+        typer.secho(f"Not installed here: {', '.join(missing)}", fg=typer.colors.BRIGHT_BLACK)
+    typer.secho(
+        f"{installed} skill install(s) across {len(found)} tool(s).",
+        fg=typer.colors.GREEN if installed else typer.colors.CYAN,
+    )
+    typer.secho("Restart a tool to pick up its new skills.", fg=typer.colors.BRIGHT_BLACK)
 
 
 # --- bulk cleanup of stale sessions (Shift+X) --------------------------------
@@ -985,6 +1064,22 @@ def _valid_colors(overrides: dict[str, str]) -> dict[str, str]:
             continue  # invalid style string -> fall back to the default for this key
         good[key] = value
     return good
+
+
+def _session_branch(path: Path) -> str | None:
+    """The branch actually checked out in a session, or ``None`` if unreadable.
+
+    A session starts on a branch named after its worktree, but nothing keeps it
+    there — a PR flow may rename it to something readable (`feat/…`), so anything
+    that shows or deletes the branch must ask git rather than assume the name.
+    Best-effort: a git error, or a detached HEAD (no branch to name), gives
+    ``None`` and callers fall back to the worktree name.
+    """
+    try:
+        branch = git_ops.current_branch(path)
+    except git_ops.GitError:
+        return None
+    return branch if branch and branch != "HEAD" else None
 
 
 def _worktree_dirty(path: Path) -> bool:
@@ -1774,6 +1869,12 @@ def main(
         "(use --label=-TAG). On its own it labels the session you are in (or "
         "--name NAME); alongside a repo URL or --chat it labels the new session.",
     ),
+    install_skills: bool = typer.Option(
+        False,
+        "--skills",
+        help="Install vv's bundled agent skills (the `pr` skill) into every "
+        "supported agent tool found on this machine, then exit.",
+    ),
     emit_cwd: str = typer.Option(
         None,
         "--emit-cwd",
@@ -1805,6 +1906,14 @@ def main(
             else "local" if remote_mode is False
             else config.configured_mode()
         )
+        # Installing skills configures the agent tools on *this* machine, so it
+        # never routes through remote mode — same reasoning as annotating a
+        # session below. Inside a remote session you are running the remote vv,
+        # and it is that machine's tools you want the skills in.
+        if install_skills:
+            _install_skills()
+            return
+
         pending_notes = notes.Pending(title=title, label_specs=tuple(label or []))
 
         # Annotating an *existing* session is pure local bookkeeping on the

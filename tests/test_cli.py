@@ -147,16 +147,29 @@ def delete_harness(monkeypatch, tmp_path):
     monkeypatch.setenv("WORKSPACES_DIR", str(tmp_path / "ws"))
     calls: dict[str, list] = {"removed": [], "branches": [], "killed": [], "confirms": []}
 
-    monkeypatch.setattr(cli.git_ops, "remove_worktree",
-                        lambda ws, p, force=False: calls["removed"].append(force))
+    gone = {"worktree": False}  # flips once the worktree has been removed
+
+    def fake_remove(ws, p, force=False):
+        calls["removed"].append(force)
+        gone["worktree"] = True
+
+    monkeypatch.setattr(cli.git_ops, "remove_worktree", fake_remove)
     monkeypatch.setattr(cli.git_ops, "delete_branch",
                         lambda ws, b, force=False: calls["branches"].append((b, force)))
     monkeypatch.setattr(cli.tmux_ops, "kill_session",
                         lambda name: calls["killed"].append(name))
 
-    def configure(*, dirty=False, unpushed=0, confirm=True):
+    def configure(*, dirty=False, unpushed=0, confirm=True, branch="falcon"):
         monkeypatch.setattr(cli.git_ops, "is_dirty", lambda p: dirty)
         monkeypatch.setattr(cli.git_ops, "unpushed_count", lambda p: unpushed)
+
+        def fake_current_branch(p):
+            # Mirrors reality: once the worktree is gone, git can't be run in it.
+            if gone["worktree"]:
+                raise cli.git_ops.GitError("no such worktree")
+            return branch
+
+        monkeypatch.setattr(cli.git_ops, "current_branch", fake_current_branch)
 
         def fake_confirm(*args, **kwargs):
             calls["confirms"].append(args[0] if args else "")
@@ -173,6 +186,23 @@ def test_delete_clean_worktree_skips_the_warning(delete_harness, tmp_path):
     cli._delete_session("repo", "falcon", tmp_path / "wt", live=set())
     assert calls["confirms"] == []          # nothing at risk -> no prompt
     assert calls["removed"] == [True]       # force-removed
+    assert calls["branches"] == [("falcon", True)]
+
+
+def test_delete_removes_the_renamed_branch_not_the_session_name(delete_harness, tmp_path):
+    # A PR flow may rename the branch; deleting by the worktree's name would
+    # orphan it. The read must also happen before the worktree is removed.
+    calls = delete_harness(dirty=False, unpushed=0, branch="feat/session-cards")
+    cli._delete_session("repo", "falcon", tmp_path / "wt", live=set())
+    assert calls["branches"] == [("feat/session-cards", True)]
+
+
+def test_delete_falls_back_to_the_session_name_when_the_branch_is_unreadable(
+    delete_harness, tmp_path, monkeypatch
+):
+    calls = delete_harness(dirty=False, unpushed=0)
+    monkeypatch.setattr(cli, "_session_branch", lambda p: None)
+    cli._delete_session("repo", "falcon", tmp_path / "wt", live=set())
     assert calls["branches"] == [("falcon", True)]
 
 
@@ -241,6 +271,7 @@ def sessions_menu(monkeypatch, tmp_path):
         "resumed": [],    # names _resume_session was called for
         "focus": [],      # the focus value each _pick_session render got
         "renders": 0,     # how many times the menu was drawn
+        "cards": [],      # the cards from the last _pick_session render
     }
 
     monkeypatch.setattr(cli, "_list_worktrees", lambda: list(state["sessions"]))
@@ -252,6 +283,7 @@ def sessions_menu(monkeypatch, tmp_path):
 
     def fake_pick(message, choices, cards, *a, focus=None, **kw):
         state["renders"] += 1
+        state["cards"] = list(cards)
         state["focus"].append(None if focus is None else focus[1])
         action, name = state["picks"].pop(0)
         if action == "cancel":
@@ -651,12 +683,12 @@ def new_session_env(monkeypatch, tmp_path, remote_repo):
     cli.git_ops.clone(str(remote_repo), workspace)
 
     monkeypatch.setattr(cli.tmux_ops, "list_sessions", lambda *_a, **_k: [])
-    monkeypatch.setattr(cli.names, "random_name", lambda _taken: "falcon")
+    monkeypatch.setattr(cli.names, "random_name", lambda _taken: "brave-falcon")
     monkeypatch.setattr(cli, "_resume_worktree", lambda *a, **k: None)
 
     def start():
         cli._new_worktree_session("repo", workspace, "claude", bypass=True)
-        return tmp_path / "wt" / "repo" / "falcon"
+        return tmp_path / "wt" / "repo" / "brave-falcon"
 
     return start
 
@@ -755,9 +787,9 @@ def test_new_chat_session_creates_dir_under_chats(chat_env):
     chats_root = chat_env / "wt" / "_chats"
     created = [p for p in chats_root.iterdir() if p.is_dir()]
     assert len(created) == 1
-    # The picked name must be a real word from the curated pool.
-    from vv.names import WORDS
-    assert created[0].name in WORDS
+    # The picked name must be a real <adjective>-<animal> from the curated pools.
+    from vv import names
+    assert created[0].name in set(names.all_names())
 
 
 def test_list_worktrees_surfaces_chats_under_sentinel(chat_env):
@@ -1579,6 +1611,52 @@ def test_session_summaries_prunes_deleted_sessions_from_cache(monkeypatch, tmp_p
 
 
 # --- session cards ----------------------------------------------------------
+
+
+def test_session_branch_reads_the_checked_out_branch(monkeypatch, tmp_path):
+    monkeypatch.setattr(cli.git_ops, "current_branch", lambda p: "feat/session-cards")
+    assert cli._session_branch(tmp_path) == "feat/session-cards"
+
+
+def test_session_branch_is_none_on_a_git_error(monkeypatch, tmp_path):
+    def boom(p):
+        raise cli.git_ops.GitError("not a worktree")
+
+    monkeypatch.setattr(cli.git_ops, "current_branch", boom)
+    assert cli._session_branch(tmp_path) is None
+
+
+def test_session_branch_is_none_when_detached(monkeypatch, tmp_path):
+    # A detached HEAD has no branch to name, let alone delete.
+    monkeypatch.setattr(cli.git_ops, "current_branch", lambda p: "HEAD")
+    assert cli._session_branch(tmp_path) is None
+
+
+def _git_session(tmp_path, name):
+    """Make `tmp_path/name` look like a git worktree to the card builder."""
+    path = tmp_path / name
+    path.mkdir(parents=True, exist_ok=True)
+    (path / ".git").write_text("gitdir: /nowhere\n")
+    return path
+
+
+def test_card_shows_the_renamed_branch(sessions_menu, monkeypatch, tmp_path):
+    # After a PR flow renames it, the readable branch is what reviewers see —
+    # so it is what the card must show, not the session's generated name.
+    _git_session(tmp_path, "brave-falcon")
+    state = sessions_menu(["brave-falcon"], [("cancel", None)])
+    monkeypatch.setattr(cli, "_session_branch", lambda p: "feat/session-cards")
+    cli._menu_list_sessions("claude", bypass=True)
+    assert state["cards"][0]["branch"] == "feat/session-cards"
+
+
+def test_card_branch_falls_back_to_the_session_name(sessions_menu, monkeypatch, tmp_path):
+    _git_session(tmp_path, "brave-falcon")
+    state = sessions_menu(["brave-falcon"], [("cancel", None)])
+    monkeypatch.setattr(cli, "_session_branch", lambda p: None)
+    cli._menu_list_sessions("claude", bypass=True)
+    assert state["cards"][0]["branch"] == "brave-falcon"
+
 
 def _plain(rows):
     """Flatten card rows to plain lines (dropping styles) for assertions."""
