@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import shutil
+import string
 import textwrap
 import threading
 from dataclasses import dataclass
@@ -667,7 +668,7 @@ def _menu_list_sessions(default_agent: str, bypass: bool) -> None:
             choices.append(questionary.Choice(title=f"{repo}/{name}", value=(repo, name, path)))
 
         action, value = _pick_session(
-            "Sessions  ·  enter to resume · x to delete · X to clean up stale",
+            "Sessions  ·  enter to resume · x to delete · X to clean up stale · / to filter",
             choices,
             cards,
             pr_snapshot,
@@ -1225,6 +1226,17 @@ def _card_lines(
     return rows
 
 
+def _visible_cards(control, cards: list[dict]) -> list[dict]:
+    """The cards for the choices the filter is currently showing, in order.
+
+    ``cards`` is parallel to the control's choices, but a filter narrows what
+    the control renders, and ``pointed_at`` indexes *that* list — so the cards
+    have to be narrowed the same way or the highlight lands on the wrong session.
+    """
+    by_choice = {id(choice): card for choice, card in zip(control.choices, cards)}
+    return [by_choice[id(c)] for c in control.filtered_choices]
+
+
 def _render_cards(
     cards: list[dict], pointed_at: int, width: int, theme: "CardTheme | None" = None
 ) -> list[tuple[str, str]]:
@@ -1303,6 +1315,114 @@ def _card_style(theme: "CardTheme | None" = None):
     return Style(rules)
 
 
+# --- type-to-filter, gated behind '/' ----------------------------------------
+
+#: Characters that type into an active filter. questionary's own search binds
+#: all of ``string.printable``, which drags in ``\r``/``\n``/``\t`` — the keys
+#: that submit and navigate. Only characters that can be part of a name here.
+_FILTER_CHARS = string.ascii_letters + string.digits + string.punctuation + " "
+
+
+def _choice_control(question: "questionary.Question"):
+    """The ``InquirerControl`` behind a ``questionary.select``.
+
+    questionary exposes no handle on it, so every extra key binding and custom
+    renderer we hang off a select has to dig it out of the prompt_toolkit layout.
+    """
+    from questionary.prompts.common import InquirerControl
+
+    return next(
+        c
+        for c in question.application.layout.find_all_controls()
+        if isinstance(c, InquirerControl)
+    )
+
+
+def _enable_filter(question: "questionary.Question", control=None):
+    """Bind ``/`` to a type-to-filter mode over a select's choices.
+
+    questionary's own ``use_search_filter`` binds *every* printable key
+    unconditionally, which cannot coexist with single-key shortcuts — ``x`` in
+    the middle of a filter would delete the highlighted session. So filtering is
+    **modal**: ``/`` starts it, typing narrows the list to choices whose title
+    contains the text (questionary's own substring match, via ``search_filter``),
+    backspace rubs it out, and Esc leaves and clears it. Arrow keys and Enter
+    keep working throughout, so a filter can be typed and its result resumed
+    without leaving the mode.
+
+    Returns the prompt_toolkit ``Condition`` that is true while the user is
+    typing a filter: callers guard their own single-key bindings with
+    ``filter=~typing`` so those keys type instead of firing (and, being
+    inactive, they lose to the filter's binding for the same key regardless of
+    which was registered first).
+
+    The ``/ …`` footer showing the current text is questionary's, drawn for any
+    select whose ``search_filter`` is set — we only ever set it.
+    """
+    from prompt_toolkit.filters import Condition
+    from prompt_toolkit.keys import Keys
+
+    control = control or _choice_control(question)
+    active = {"on": False}
+    typing = Condition(lambda: active["on"])
+
+    def _set(text: str | None) -> None:
+        """Apply a new filter text, keeping the cursor on the pointed-at choice.
+
+        ``pointed_at`` indexes the *filtered* list, so it has to be re-resolved
+        against the new one; a choice the filter just hid falls back to the top.
+        """
+        current = control.get_pointed_at()
+        control.search_filter = text
+        control.found_in_search = True  # stale until `filtered_choices` re-runs
+        visible = control.filtered_choices
+        control.pointed_at = visible.index(current) if current in visible else 0
+
+    def _stop() -> None:
+        active["on"] = False
+        _set(None)
+
+    bindings = question.application.key_bindings
+
+    @bindings.add("/", eager=True, filter=~typing)
+    def _start(event) -> None:
+        active["on"] = True
+        _set("")  # empty filter: shows everything, but draws the '/' footer
+
+    # Not eager: Escape leads every meta/alt sequence (arrow keys are already
+    # resolved by prompt_toolkit's vt100 parser, but Alt+<key> is not), so let
+    # the two-key bindings below get their chance at it first.
+    @bindings.add(Keys.Escape, filter=typing)
+    def _cancel(event) -> None:
+        _stop()
+
+    # Esc *immediately* followed by Enter reaches prompt_toolkit as one meta
+    # sequence, which its default bindings hand to the (empty) prompt buffer and
+    # answer with "" — so leaving the filter and hitting Enter in one motion
+    # would drop the choice. Read it as what it means: leave, then select.
+    @bindings.add(Keys.Escape, Keys.ControlM, eager=True)
+    def _cancel_and_select(event) -> None:
+        _stop()
+        control.is_answered = True
+        event.app.exit(result=control.get_pointed_at().value)
+
+    @bindings.add(Keys.Backspace, eager=True, filter=typing)
+    def _rub_out(event) -> None:
+        text = control.search_filter or ""
+        if text:
+            _set(text[:-1])
+        else:
+            _stop()  # backspacing past the start leaves the mode
+
+    def _type(event) -> None:
+        _set((control.search_filter or "") + event.data)
+
+    for char in _FILTER_CHARS:
+        bindings.add(char, eager=True, filter=typing)(_type)
+
+    return typing
+
+
 def _pick_session(
     message: str,
     choices: list,
@@ -1330,12 +1450,16 @@ def _pick_session(
     ``focus`` is a choice value to start the cursor on (questionary's ``default``),
     which keeps the cursor in place when the view is re-entered after a delete.
 
+    ``/`` filters the list by session name (see :func:`_enable_filter`); the
+    cards shown are then the filter's, so the renderer walks
+    ``control.filtered_choices`` rather than the full ``cards`` list.
+
     Three actions come back: ``"select"`` (Enter), ``"delete"`` (``x``, the
     pointed-at session) and ``"sweep"`` (``X``, bulk-clean the stale ones — it
     still reports the pointed-at session so the caller can restore the cursor).
+    Both shortcuts are held back while a filter is being typed, so ``x`` there
+    is a character and not a deletion.
     """
-    from questionary.prompts.common import InquirerControl
-
     theme = theme or _DEFAULT_THEME
     question = questionary.select(
         message,
@@ -1345,20 +1469,19 @@ def _pick_session(
         instruction=" ",
         default=focus,
     )
-    control = next(
-        c
-        for c in question.application.layout.find_all_controls()
-        if isinstance(c, InquirerControl)
-    )
+    control = _choice_control(question)
     width = shutil.get_terminal_size().columns
-    control.text = lambda: _render_cards(cards, control.pointed_at, width, theme)
+    control.text = lambda: _render_cards(
+        _visible_cards(control, cards), control.pointed_at, width, theme
+    )
     _keep_card_visible(question, cards, width)
+    typing = _enable_filter(question, control)
 
-    @question.application.key_bindings.add("x", eager=True)
+    @question.application.key_bindings.add("x", eager=True, filter=~typing)
     def _request_delete(event) -> None:
         event.app.exit(result=(_DELETE, control.get_pointed_at().value))
 
-    @question.application.key_bindings.add("X", eager=True)
+    @question.application.key_bindings.add("X", eager=True, filter=~typing)
     def _request_sweep(event) -> None:
         event.app.exit(result=(_SWEEP, control.get_pointed_at().value))
 
@@ -1445,19 +1568,15 @@ def _pick_with_delete(message: str, choices: list) -> tuple[str, object]:
 
     The ``x`` shortcut is wired by reaching into the prompt's prompt_toolkit
     application — questionary's public ``select`` exposes no hook for extra
-    keys — and reading the currently highlighted choice off its control.
+    keys — and reading the currently highlighted choice off its control. ``/``
+    filters the list, and holds ``x`` back while the filter is being typed.
     """
-    from questionary.prompts.common import InquirerControl
-
     question = questionary.select(message, choices=choices)
     _wrap_choice_lines(question)
-    control = next(
-        c
-        for c in question.application.layout.find_all_controls()
-        if isinstance(c, InquirerControl)
-    )
+    control = _choice_control(question)
+    typing = _enable_filter(question, control)
 
-    @question.application.key_bindings.add("x", eager=True)
+    @question.application.key_bindings.add("x", eager=True, filter=~typing)
     def _request_delete(event) -> None:
         event.app.exit(result=(_DELETE, control.get_pointed_at().value))
 
@@ -1549,7 +1668,8 @@ def _menu_new_from_repo(default_agent: str, bypass: bool) -> None:
         )
         return
     action, choice = _pick_repo(
-        "New session from which repo?  ('x' deletes the highlighted repo)", repos
+        "New session from which repo?  ('/' filters, 'x' deletes the highlighted repo)",
+        repos,
     )
     if action == "cancel":
         return
@@ -1593,20 +1713,19 @@ def _pick_github_repo(repos: list[str]) -> object | None:
 
     Returns the chosen ``owner/name`` string, the :data:`_ENTER_URL` sentinel
     when the user opts to type a clone URL instead, or ``None`` if cancelled.
-    Typing filters the list by substring (questionary's ``use_search_filter``);
-    at most 5 rows show at once, scrollable with the arrow keys.
+    ``/`` filters the list by substring (:func:`_enable_filter`); at most 5 rows
+    show at once, scrollable with the arrow keys.
     """
     choices = [
         questionary.Choice(title="↗  Enter a clone URL instead…", value=_ENTER_URL),
         *repos,
     ]
     question = questionary.select(
-        "Pick a GitHub repo (type to filter), or enter a URL:",
+        "Pick a GitHub repo ('/' filters), or enter a URL:",
         choices=choices,
-        use_search_filter=True,  # typing filters the list (substring match)
-        use_jk_keys=False,       # required with search filter: j/k become input
         show_selected=False,
     )
+    _enable_filter(question)
     _cap_select_rows(question, 5)
     return question.ask()
 
@@ -1653,7 +1772,7 @@ _REPO_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 def _pick_template(templates: list[str]) -> object | None:
     """Pick a template repo to generate a new project from, or an empty one.
 
-    Same shape as :func:`_pick_github_repo` — scrollable, filter-as-you-type,
+    Same shape as :func:`_pick_github_repo` — scrollable, ``/`` to filter,
     5 rows — with the :data:`_EMPTY_REPO` sentinel first so "no template" is
     always one keystroke away even when the list is long. Returns the chosen
     ``owner/name``, the sentinel, or ``None`` if cancelled.
@@ -1663,12 +1782,11 @@ def _pick_template(templates: list[str]) -> object | None:
         *templates,
     ]
     question = questionary.select(
-        "Start from which template (type to filter)?",
+        "Start from which template ('/' filters)?",
         choices=choices,
-        use_search_filter=True,  # typing filters the list (substring match)
-        use_jk_keys=False,       # required with search filter: j/k become input
         show_selected=False,
     )
+    _enable_filter(question)
     _cap_select_rows(question, 5)
     return question.ask()
 
@@ -1678,10 +1796,9 @@ def _pick_owner(owners: list[str]) -> str | None:
     question = questionary.select(
         "Create it under which account?",
         choices=owners,
-        use_search_filter=True,
-        use_jk_keys=False,
         show_selected=False,
     )
+    _enable_filter(question)
     _cap_select_rows(question, 5)
     return question.ask()
 

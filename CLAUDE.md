@@ -72,8 +72,8 @@ copies vv's bundled agent skills into every agent tool on this machine and exits
 
 `_menu_add_repo()` shows a scrollable `questionary.select` of every GitHub repo
 the user can access (`_pick_github_repo()`) when `gh_ops.is_available()` (gh on PATH
-and logged in). Typing filters the `owner/name` list by **substring**
-(`use_search_filter=True`, which forces `use_jk_keys=False`); `_cap_select_rows()`
+and logged in). `/` filters the `owner/name` list by **substring** (see
+"Filtering a list with `/`" below); `_cap_select_rows()`
 limits it to 5 visible rows (it reaches into the prompt_toolkit layout and caps
 the choices `Window` height — purely cosmetic, wrapped in a swallow-all `try`).
 A first sentinel choice (`_ENTER_URL`) drops to a free-text clone-URL prompt; a
@@ -88,7 +88,7 @@ the original plain URL `questionary.text`. All paths feed `_start_from_url`.
 name → visibility — and then feeds `_start_from_url` exactly like the picker
 above, so everything downstream (clone, worktree, tmux, agent) is the existing
 path. The template picker (`_pick_template()`) is `_pick_github_repo()`'s twin
-(same substring filter, same `_cap_select_rows(5)`) over
+(same `/` filter, same `_cap_select_rows(5)`) over
 `gh_ops.list_template_repos()`, with an `_EMPTY_REPO` sentinel first so "no
 template" stays one keystroke away in a long list. Templates are **filtered from
 the same cached `user/repos` walk** as the repo picker (`list_repos_detailed()`
@@ -143,7 +143,8 @@ public hook — and returns a `("select" | "delete" | "cancel", repo)` tuple.)
 The "list existing sessions" menu (`_menu_list_sessions()`) offers each chosen
 worktree a **resume** (→ `_resume_session()`) or **delete** (→
 `_delete_session()`) action, plus a **sweep** of all the stale ones at once
-(→ `_sweep_stale_sessions()`, see below). It is a **loop**: a delete or sweep
+(→ `_sweep_stale_sessions()`, see below) and a **`/` filter** over `repo/name`
+(see "Filtering a list with `/`" below). It is a **loop**: a delete or sweep
 rebuilds and redraws the list instead of leaving the menu, so a run of stale
 sessions can be cleaned up in one visit (resume and cancel still leave; an
 emptied list exits with "No sessions left."). The cursor is carried across the
@@ -237,6 +238,41 @@ branch through `_delete_chat()` for their warning (no git ops, but the user is
 still warned if the directory is non-empty) and `_remove_session()` `rmtree`s
 them. Every deletion path (plus `_delete_repo()`, via `notes.forget_repo()`)
 clears the session's notes so they don't linger in the store.
+
+#### Filtering a list with `/` (`_enable_filter()`)
+
+Every list long enough to hunt through — the session cards, the cloned-repo
+picker, and the gh repo/template/owner pickers — filters the same way: **`/`**
+starts it, typing narrows the list to choices whose title contains the text,
+backspace rubs it out, and **Esc** leaves and clears it. Arrow keys and Enter
+keep working while typing, so a filter can be typed and its result resumed
+without leaving the mode. Matching is questionary's own (`control.search_filter`
++ `filtered_choices`, a case-insensitive substring of the choice *title*), which
+for sessions is `repo/name` — the worktree name and its repo, not the summary,
+labels or branch on the card. A filter matching nothing falls back to showing
+everything (questionary's behavior), and the `/ text…` footer under the list is
+likewise questionary's, drawn for any select whose `search_filter` is set — vv
+only ever sets it.
+
+Filtering is **modal** for one reason: questionary's own `use_search_filter`
+binds *every* printable key unconditionally, which cannot coexist with the
+single-key shortcuts — `x` in the middle of a filter would delete the
+highlighted session. So `_enable_filter()` binds the characters itself, behind a
+prompt_toolkit `Condition` it returns; callers guard their own bindings with
+`filter=~typing` so `x`/`X` become characters while a filter is being typed
+(and, being inactive, lose to the filter's binding for the same key regardless
+of registration order). Two details: the cursor **keeps its choice** across
+every filter change when that choice is still visible (so Esc leaves you where
+you were looking, not at the top); and `Esc` is bound *non-eagerly* while
+`Escape Enter` — which prompt_toolkit hands to its empty prompt buffer, and
+which would otherwise answer `""` — is bound explicitly to "leave the filter and
+select", since leaving and confirming in one motion arrives as a single meta
+sequence.
+
+Because the cards are rendered by vv rather than questionary, `_pick_session()`
+must narrow them itself: `_visible_cards()` maps `control.filtered_choices` back
+to cards, since `pointed_at` indexes the *filtered* list and the highlight would
+otherwise land on the wrong session.
 
 #### Bulk cleanup of stale sessions (Shift+X)
 

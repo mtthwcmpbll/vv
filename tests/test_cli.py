@@ -431,6 +431,69 @@ def test_pick_session_sweep_reports_the_pointed_at_session(pick_session_keys):
     assert (action, value[1]) == ("sweep", "beta")  # so the cursor can be restored
 
 
+# --- '/' to filter the list --------------------------------------------------
+
+def test_pick_session_slash_filters_by_session_name(pick_session_keys):
+    action, value = pick_session_keys("/bet\r")     # '/', type, enter
+    assert (action, value[1]) == ("select", "beta")
+
+
+def test_filtering_holds_back_the_delete_shortcuts(pick_session_keys):
+    """'x' is a character while a filter is being typed, never a deletion."""
+    action, value = pick_session_keys("/alpha\rx")  # the 'x' lands after the enter
+    assert (action, value[1]) == ("select", "alpha")
+
+
+def test_escape_leaves_the_filter_and_keeps_the_pointed_at_session(pick_session_keys):
+    action, value = pick_session_keys("/bet\x1bx")  # filter, escape, then delete
+    assert (action, value[1]) == ("delete", "beta")
+
+
+def test_escape_then_enter_selects_rather_than_answering_empty(pick_session_keys):
+    """Esc+Enter in one motion arrives as a meta sequence; it must still select."""
+    action, value = pick_session_keys("/bet\x1b\r")
+    assert (action, value[1]) == ("select", "beta")
+
+
+def test_backspacing_past_the_start_leaves_the_filter(pick_session_keys):
+    # 'b' narrows to (and points at) beta; two rub-outs clear the text and then
+    # the mode itself, leaving the cursor on the session it had landed on.
+    action, value = pick_session_keys("/b\x7f\x7fx")
+    assert (action, value[1]) == ("delete", "beta")
+
+
+def test_a_filter_that_matches_nothing_keeps_the_whole_list(pick_session_keys):
+    action, value = pick_session_keys("/zzz\r")
+    assert (action, value[1]) == ("select", "alpha")
+
+
+def test_visible_cards_follow_the_filter():
+    """The cards rendered are the filtered ones, so the highlight tracks the cursor."""
+    choices = [cli.questionary.Choice(title=f"repo/{n}", value=n) for n in ("alpha", "beta")]
+    question = cli.questionary.select("m", choices=choices)
+    control = cli._choice_control(question)
+    cards = [{"folder": "repo/alpha"}, {"folder": "repo/beta"}]
+
+    assert cli._visible_cards(control, cards) == cards
+    control.search_filter = "bet"
+    assert cli._visible_cards(control, cards) == [cards[1]]
+
+
+def test_pick_github_repo_filters_with_slash(monkeypatch):
+    """The same '/' filter drives the plain-list pickers (gh repos, templates, owners)."""
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    real_select = cli.questionary.select
+    with create_pipe_input() as pipe:
+        pipe.send_text("/two\r")
+        monkeypatch.setattr(
+            cli.questionary, "select",
+            lambda *a, **k: real_select(*a, **k, input=pipe, output=DummyOutput()),
+        )
+        assert cli._pick_github_repo(["me/one", "me/two"]) == "me/two"
+
+
 # --- the stale sweep (Shift+X): which sessions qualify -----------------------
 
 _MERGED = {"number": 12, "state": "merged", "checks": "passing"}
