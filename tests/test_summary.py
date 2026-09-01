@@ -340,3 +340,57 @@ def test_cache_ignored_on_version_mismatch(monkeypatch, tmp_path):
         json.dumps({"version": 999, "sessions": {"x": {"summary": "stale"}}})
     )
     assert summary.load_cache() == {}
+
+
+# --- last_turn --------------------------------------------------------------
+
+def test_last_turn_reports_who_spoke_last(stores, tmp_path):
+    session = tmp_path / "sess"
+    session.mkdir()
+    stores.write_claude(session, [
+        _cl_user("Add a dark mode toggle"),
+        _cl_assistant("Should I persist the choice too?"),
+    ])
+    assert summary.last_turn(session) == ("assistant", "Should I persist the choice too?")
+
+
+def test_last_turn_ignores_tool_calls_and_command_turns(stores, tmp_path):
+    # "The agent spoke last" must mean it actually said something to you.
+    session = tmp_path / "sess"
+    session.mkdir()
+    stores.write_claude(session, [
+        _cl_user("Fix the flake"),
+        _cl_assistant("On it."),
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Edit", "input": {}}]}},
+        _cl_user("<bash-input>pytest</bash-input>"),
+    ])
+    assert summary.last_turn(session) == ("assistant", "On it.")
+
+
+def test_last_turn_none_without_a_transcript(stores, tmp_path):
+    assert summary.last_turn(tmp_path / "nope") is None
+
+
+def test_last_turn_is_memoized_on_the_transcript_mtime(stores, tmp_path, monkeypatch):
+    """The board re-classifies on a timer; an unchanged transcript must be free."""
+    session = tmp_path / "sess"
+    session.mkdir()
+    stores.write_claude(session, [_cl_user("go"), _cl_assistant("first")])
+    assert summary.last_turn(session) == ("assistant", "first")
+
+    reads = []
+    real = summary._claude_messages
+    monkeypatch.setattr(
+        summary, "_claude_messages", lambda p: (reads.append(1), real(p))[1]
+    )
+    assert summary.last_turn(session) == ("assistant", "first")
+    assert reads == []                                   # served from the memo
+
+    # Touching the transcript invalidates it.
+    stores.write_claude(session, [_cl_user("go"), _cl_assistant("second")])
+    transcript = summary._transcript_path(session)
+    import os
+    os.utime(transcript, (0, 0))
+    assert summary.last_turn(session) == ("assistant", "second")
+    assert reads == [1]

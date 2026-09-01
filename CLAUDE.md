@@ -66,6 +66,11 @@ A fifth flow starts no session at all: **`vv --title TEXT`** (`-t`) /
 **`vv --label TAG`** (`-l`) → `cli._apply_notes()` annotates an *existing*
 session and exits (see "Session notes" below).
 
+A seventh starts no session either: **`vv --watch`** (`-w`) →
+`cli._watch_board()` opens the live session board (see "The session board"
+below) and returns when you leave it. It is also the first entry in the
+interactive menu.
+
 A sixth likewise starts nothing: **`vv --skills`** → `cli._install_skills()`
 copies vv's bundled agent skills into every agent tool on this machine and exits
 (see "Bundled skills" below).
@@ -144,8 +149,11 @@ The "list existing sessions" menu (`_menu_list_sessions()`) offers each chosen
 worktree a **resume** (→ `_resume_session()`) or **delete** (→
 `_delete_session()`) action, plus a **sweep** of all the stale ones at once
 (→ `_sweep_stale_sessions()`, see below) and a **`/` filter** over `repo/name`
-(see "Filtering a list with `/`" below). It is a **loop**: a delete or sweep
-rebuilds and redraws the list instead of leaving the menu, so a run of stale
+(see "Filtering a list with `/`" below). Sessions are **ordered by triage state** (`state.ORDER`, most-wants-you-first),
+with `_list_worktrees()`'s repo/newest-first order surviving as the stable
+tiebreak within a state — so the list reads as a queue rather than a pile. It is
+a **loop**: a delete or sweep rebuilds and redraws the list instead of leaving
+the menu, so a run of stale
 sessions can be cleaned up in one visit (resume and cancel still leave; an
 emptied list exits with "No sessions left."). The cursor is carried across the
 redraw — `_delete_session()` /
@@ -167,10 +175,17 @@ carry the `agent` they were generated with so switching `summary_agent`
 invalidates them.
 
 Each session is drawn as a **cmux-style card** (a bordered rectangle) rather than
-a flat row: `_card_lines()` renders a **headline** (with a `●` running / `○` idle
-dot) — the user's own `--title` when they set one, else the generated summary. A
+a flat row: `_card_lines()` renders a **headline** led by the **triage dot** —
+one glyph per `state.py` state (`◆` needs you / `✕` stopped / `▸` working / `◇`
+in review / `▹` idle), *not* "is a tmux session up", which was true of every
+session that hadn't been deleted and so said nothing. The headline itself is the
+user's own `--title` when they set one, else the generated summary. A
 title does not *replace* the summary: it displaces it to the row below, indented
-and in the quieter `card.summary` style, so a card can carry both. Then — when
+and in the quieter `card.summary` style, so a card can carry both. Then, when the
+state carries a `detail` (only `needs_you` does), the **agent's own last words**
+on one line prefixed by the `detail` glyph — "Should I also update the tests?"
+tells you what to do in a way a summary of the work cannot. It is `_fit`-truncated
+rather than wrapped, so a chatty agent can't inflate the card. Then — when
 the session has any — a row of `#label` chips indented the same way (both from
 `notes.all_notes()`; chips are joined by the `label_gap` glyph and wrapped like
 the headline, and each row is omitted entirely when empty), then a
@@ -197,7 +212,10 @@ but **swaps out the per-choice renderer**: it sets `control.text` to
 wash layered onto every segment — full color *and* whole-card highlight, which
 questionary's built-in string/`class:highlighted` rendering can't do together.
 Every card **glyph and color is themeable from config**: `_DEFAULT_GLYPHS` /
-`_DEFAULT_COLORS` hold the defaults, `_card_theme()` layers the config's
+`_DEFAULT_COLORS` hold the defaults (the dot's five entries are keyed by the
+`state.py` constants themselves — `needs_you` / `stopped` / `working` / `review`
+/ `idle` — so `g[session_state.state]` is the whole lookup; the old `running`
+key is now `working`), `_card_theme()` layers the config's
 `[cards.glyphs]` / `[cards.colors]` tables (`config.configured_card_glyphs()` /
 `configured_card_colors()`) over them into a `CardTheme` that threads through
 `_card_lines` / `_pr_segment` / `_render_cards` / `_card_style` (each defaults to
@@ -313,6 +331,109 @@ the one place in vv where waiting on `gh` is the right trade, and it prints
 one locked worktree reports `! kept repo/name: …` and the rest of the batch still
 goes through — the closing tally is "Deleted N of M".
 
+### Triage state: whose turn is it (`state.py`)
+
+The cards always answered *what* a session is — summary, branch, PR. The
+question you actually ask with twenty open is **which one is waiting on me**,
+and nothing answered it: the old running dot only meant "a tmux session exists",
+which is true of everything you haven't deleted.
+
+`state.py` computes that missing axis. Five states in `ORDER`, most-wants-you
+first: `needs_you`, `stopped`, `working`, `review`, `idle`. It drives the card
+dot, the session list's ordering, and the board's lanes.
+
+Three signals, **all already paid for elsewhere**, which is what makes this cheap
+enough to recompute on a timer:
+
+- `tmux_ops.session_activity()` — one `list-panes -a` for the whole server
+  (so fifty sessions cost what two do), giving each session's `session_activity`
+  timestamp and its **active pane's foreground command**. That second field is
+  the one nothing else had: a pane back at a shell (`Activity.at_shell`, against
+  `tmux_ops.SHELL_COMMANDS`) means the agent vv launched has exited, which is
+  otherwise invisible — such a session looks healthy from the outside.
+- `summary.last_turn()` — the last *real* conversation turn, reusing the same
+  transcript readers and `_clean_turn` filter the summaries use (so "the agent
+  spoke last" means it actually said something, not that it made a tool call).
+  Memoized on the transcript's mtime, so a refresh is free for every session that
+  hasn't moved.
+- the `dirty` / `pr` facts the cards compute anyway, passed in as `state.Facts`
+  rather than recomputed.
+
+`classify()` is **pure and fully injectable** — every input is an argument — so
+the whole machine is testable without tmux, a transcript or a repo. The rules,
+and why:
+
+- **No tmux session** → nothing is running, so nothing is waiting on you: the
+  work decides (`review` if a PR is open/draft, else `idle`). Note that
+  uncommitted work here is deliberately *not* `needs_you`: it is already flagged
+  by the card's dirty marker and protected by the sweep, and counting it as
+  urgent would flood the lane with every parked session carrying a stray edit.
+- **Pane at a shell, and quiet** → `stopped`. The quiet requirement is the guard
+  against a false positive: an agent shelling out for a tool call can briefly put
+  a shell in the foreground while output is still flowing.
+- **Output within `Windows.active`** (60s) → `working`.
+- **Quiet, agent spoke last** → `needs_you`, carrying the agent's message as
+  `detail`.
+- **Quiet, you spoke last** → still `working`; the agent hasn't answered yet, it
+  is just slower than the active window.
+- **Quiet past `Windows.stale`** (24h) → falls out of `needs_you` into
+  `review`/`idle`.
+
+That last rule is the load-bearing one, and the reason the lane is useful. An
+agent that stopped an hour ago is waiting on you; one that stopped last Tuesday
+is abandoned, and treating the two the same is precisely how the pile became
+indistinguishable. `needs_you` therefore holds *today's* work, and everything
+older drains into `idle` where `_sweep_stale_sessions` can eat it. Both windows
+come from the config's `[board]` table via `cli._state_windows()`.
+
+`classify_all()` is the batch entry point: one tmux call, transcript reads fanned
+over a small pool, keyed exactly like the sessions dict it is given. Missing tmux
+degrades to "nothing is running" rather than raising — states are UI decoration,
+and a board that dies because tmux isn't installed is worse than one that shows
+everything idle.
+
+### The session board (`vv --watch`)
+
+The session list is something you open when you remember to; the board is
+something you leave open in a cmux tab and glance at. `_watch_board()` renders
+every session as a card in a **lane per triage state**, and re-reads the world
+every `[board] refresh` seconds.
+
+`_BoardModel.reload()` rebuilds wholesale, which is only affordable because
+nothing in it runs an agent or blocks on the network: states as above, PR
+statuses from the `pr.Snapshot` cache with the stale ones refetched in a
+background thread and picked up by the *next* reload (one at a time, so a slow
+`gh` can't stack threads on a board left open all day), and summaries read
+straight from `summary.load_cache()` and **never regenerated** — `summarize_all`
+on a timer would spawn an agent process per session, per tick. There is a test
+that fails if the board ever calls it.
+
+Lanes are dropped when empty, **except `needs_you`**, which is kept even at zero:
+"nothing is waiting on you" is the most useful thing the board can say, and it
+can only say it by leaving the lane visible.
+
+`_board_rows()` lays lanes out **side by side when they fit** (`len(lanes) *
+_LANE_MIN_WIDTH`) and stacks them vertically when they don't, so a narrow
+terminal gets one tall readable column instead of four cramped ones. Every row it
+emits is padded to exactly the same width — including the blank separators —
+because in column mode a single over-long row shears every column to its right.
+That invariant is why `_card_lines`' `content_row()` now `_fit_segments()`-truncates:
+a long `branch · repo/name` could always overrun its card, it just clipped
+harmlessly at the terminal edge in the single-column list. Lane headers and rules
+are sized by `_card_row_width()`, mirroring `_card_lines`' own `_CARD_MAX_WIDTH`
+clamp, so on a wide screen the rule stops where the cards stop instead of
+floating past them.
+
+`_run_board()` is a full-screen prompt_toolkit `Application` (not questionary —
+there is no list to pick from). A daemon thread reloads and `invalidate()`s;
+`↑↓` move, `←→` jump lanes, `enter` resumes, `x` deletes, `r` refreshes, `q`
+quits. Two details: the cursor is remembered **by session folder, not by index**,
+so a reload that re-lanes a session (it finished; it started asking) keeps the
+cursor on it rather than dumping it wherever that slot now points; and actions
+are *returned* rather than performed, because both resuming and deleting need the
+terminal back — resume hands it to tmux, delete prompts via questionary. A delete
+loops back into a rebuilt board, like the list menu.
+
 ### Session notes (title + labels)
 
 The two **manual** levers for telling many sessions apart, deliberately kept in
@@ -425,7 +546,11 @@ opens; the remote shell's input buffer holds it until the SSH session is ready
 
 It is **transparent** — `cli._launch_remote()` forwards the invocation's intent
 to the remote vv: bare `vv` runs the remote's own interactive TUI over SSH,
-`vv <url>` / `vv --chat` run the remote create flow. `--local` is always
+`vv <url>` / `vv --chat` run the remote create flow, and `vv --watch` forwards
+too (tab titled `board`) — the board belongs on the machine whose sessions it
+shows, and opening a local one over an empty machine would be useless. Note this
+is the *opposite* call from `--skills` and `--title`/`--label`, which stay local:
+those configure or annotate *this* machine, the board reads the *sessions*. `--local` is always
 forwarded so the remote (which has no `[remote]` config of its own) never
 recurses.
 
@@ -479,7 +604,10 @@ is verified; the others in `BYPASS_FLAGS` are best-guesses.
   session titles/labels. Parses the
   config file (`configured_agent()`, `configured_summary_agent()`,
   `configured_card_glyphs()` / `configured_card_colors()` (the `[cards.*]`
-  session-card theme), `configured_ask()`, `configured_mode()`,
+  session-card theme), `configured_board()` → the `Board` dataclass (the
+  `[board]` table: `refresh` for the board's timer, `active_window` /
+  `stale_after` for the two `state.Windows`, so retuning them also retunes every
+  card's dot), `configured_ask()`, `configured_mode()`,
   `configured_clone_protocol()` → `ssh`/`https`, `configured_remote()` → the
   `Remote` dataclass); raises `ConfigError` on malformed TOML or a
   half-configured `[remote]`.
@@ -494,6 +622,12 @@ is verified; the others in `BYPASS_FLAGS` are best-guesses.
   the CLI threads into create flows, and cleanup on deletion (`forget()` /
   `forget_repo()`). Reads degrade to `{}` on a corrupt or version-mismatched
   store and skip malformed entries; writes are atomic and best-effort.
+- `state.py` — the triage state of each session: whose turn is it (see "Triage
+  state" above). Owns the five state constants, `ORDER` / `LABELS` / `RANK`, the
+  `Windows` (active/stale) that separate them, `Facts` (the caller-supplied git
+  and PR facts), the `SessionState` result, the pure `classify()` and the batch
+  `classify_all()`. Depends only on `tmux_ops` and `summary`; runs no agent,
+  touches no network, and never raises.
 - `summary.py` — generates the one-line session summaries shown in the "list
   existing sessions" menu. `PRINT_FLAGS` maps an agent command to the tokens
   that run it non-interactively (only `claude`'s is verified); `summarize()`
@@ -515,6 +649,9 @@ is verified; the others in `BYPASS_FLAGS` are best-guesses.
   reuses the same per-agent transcript file-finders (`_claude_file` /
   `_gemini_file` / `_codex_file`, factored out of the message providers) via
   `_transcript_path()` so it reflects the file that actually drives the summary.
+  `last_turn()` is the other public reader — the last real `(role, text)` turn,
+  memoized on the transcript's mtime — which is how `state.py` knows whether the
+  agent or the user spoke last.
   Two subtleties keep the cache and summaries honest: (1) `summarize()` runs the
   agent in an isolated scratch dir (`_scratch_cwd()` → `WORKTREES_DIR/.summary-scratch`),
   never the session — agent CLIs persist a transcript for their cwd, so running
@@ -554,7 +691,11 @@ is verified; the others in `BYPASS_FLAGS` are best-guesses.
   a new commit lag until the next push — the deliberate trade for a fast menu).
   Same on-disk cache shape as `summary` (version-stamped JSON, pruned to current
   sessions each refresh).
-- `tmux_ops.py` — `tmux` CLI wrappers; raises `TmuxError`.
+- `tmux_ops.py` — `tmux` CLI wrappers; raises `TmuxError`. Beyond session
+  lifecycle it exposes `session_activity()` → `{name: Activity}`, the single
+  whole-server `list-panes -a` that feeds `state.py` (last-activity timestamp,
+  attached, the active pane's foreground command, and `pane_dead`), plus
+  `SHELL_COMMANDS` and `Activity.at_shell` for "the agent exited".
 - `cmux_ops.py` — `cmux` CLI wrappers for remote mode (`is_available()`,
   `new_ssh_workspace()` → opens a `cmux ssh` workspace and returns its id,
   `send_text()` → types into a workspace, `list_workspace_titles()`); raises

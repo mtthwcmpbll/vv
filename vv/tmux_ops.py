@@ -8,6 +8,7 @@ import shutil
 import socket
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote
 
@@ -69,6 +70,84 @@ def list_sessions(*, vv_only: bool = False) -> list[str]:
             continue
         sessions.append(name)
     return sessions
+
+
+#: Foreground commands that mean a pane is sitting at a shell rather than
+#: running whatever vv launched in it. tmux reports the active pane's foreground
+#: command, so seeing one of these is how vv notices an agent has exited while
+#: its session lives on.
+SHELL_COMMANDS = frozenset({"bash", "zsh", "sh", "fish", "ksh", "tcsh", "dash", "ash"})
+
+
+@dataclass(frozen=True)
+class Activity:
+    """What tmux knows about one live session, from a single ``list-panes`` call.
+
+    ``last_activity`` is tmux's own ``session_activity``: a Unix timestamp of the
+    last output produced in the session, and the cheapest "is the agent still
+    talking?" signal there is. ``command`` is the foreground command of the
+    session's *active* pane — the one vv typed the agent into.
+    """
+
+    last_activity: float
+    attached: bool
+    command: str
+    dead: bool
+
+    @property
+    def at_shell(self) -> bool:
+        """True when the pane is back at a shell — the agent is no longer running."""
+        return self.dead or self.command in SHELL_COMMANDS
+
+
+def session_activity(*, vv_only: bool = False) -> dict[str, Activity]:
+    """Return ``{session_name: Activity}`` for every live tmux session.
+
+    One ``list-panes -a`` call covers the whole server, so this costs the same
+    for fifty sessions as for two — which is what makes it affordable on a board
+    that refreshes on a timer. Only each session's *active* pane is kept (that is
+    where the agent runs). Returns ``{}`` when no server is running, exactly like
+    :func:`list_sessions`.
+    """
+    fields = "\t".join(
+        (
+            "#{session_name}",
+            "#{session_activity}",
+            "#{session_attached}",
+            "#{pane_active}",
+            "#{pane_current_command}",
+            "#{pane_dead}",
+            f"#{{{VV_TAG}}}",
+        )
+    )
+    result = _run(["list-panes", "-a", "-F", fields], capture=True, check=False)
+    if result.returncode != 0:
+        return {}  # no server running -> no sessions
+    activity: dict[str, Activity] = {}
+    for line in (result.stdout or "").splitlines():
+        parts = line.split("\t")
+        if len(parts) != 7:
+            continue
+        name, last, attached, active, command, dead, tag = (part.strip() for part in parts)
+        if active != "1":  # only the pane the agent was launched into
+            continue
+        if vv_only and tag != "1":
+            continue
+        activity[name] = Activity(
+            last_activity=_to_float(last),
+            attached=attached == "1",
+            command=command,
+            dead=dead == "1",
+        )
+    return activity
+
+
+def _to_float(raw: str) -> float:
+    """Parse a numeric tmux field, or 0.0 when it is empty or unparseable."""
+    try:
+        return float(raw)
+    except ValueError:
+        return 0.0
 
 
 def session_exists(name: str) -> bool:

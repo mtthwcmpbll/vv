@@ -44,6 +44,21 @@ class Remote:
     ready_interval: float = 0.4
 
 
+@dataclass(frozen=True)
+class Board:
+    """Settings for the live session board (``vv --watch``) and the state dots.
+
+    ``refresh`` is how often the board re-reads the world. ``active_window`` and
+    ``stale_after`` are the two quiet-periods that separate the triage states
+    (see :class:`vv.state.Windows`); they are shared with the session list, so
+    retuning them here also retunes the dot on every card.
+    """
+
+    refresh: float = 10.0
+    active_window: float = 60.0
+    stale_after: float = 86_400.0
+
+
 DEFAULT_WORKSPACES_DIR = Path.home() / ".vv" / "workspaces"
 DEFAULT_WORKTREES_DIR = Path.home() / ".vv" / "worktrees"
 DEFAULT_CONFIG_FILE = Path.home() / ".vv" / "config.toml"
@@ -263,12 +278,46 @@ def configured_remote() -> Remote | None:
     )
 
 
-def _seconds(table: dict, key: str, default: float, *, allow_zero: bool = False) -> float:
+def configured_board() -> Board:
+    """Parse the ``[board]`` table into a :class:`Board`, defaults when absent.
+
+    Unlike ``[remote]`` there is nothing here that can be half-configured — every
+    key has a working default — so a missing table is simply the defaults. A
+    non-positive or non-numeric value still raises :class:`ConfigError` rather
+    than being ignored, since a board that silently refuses to refresh (or a
+    ``stale_after`` of zero, which would empty the "needs you" lane) looks like a
+    bug in vv rather than a typo in the config.
+    """
+    table = _load_config().get("board")
+    if not isinstance(table, dict):
+        return Board()
+    defaults = Board()
+    return Board(
+        refresh=_seconds(table, "refresh", defaults.refresh, section="board"),
+        active_window=_seconds(
+            table, "active_window", defaults.active_window, section="board"
+        ),
+        stale_after=_seconds(
+            table, "stale_after", defaults.stale_after, section="board"
+        ),
+    )
+
+
+def _seconds(
+    table: dict,
+    key: str,
+    default: float,
+    *,
+    allow_zero: bool = False,
+    section: str = "remote",
+) -> float:
     """Read ``table[key]`` as a number of seconds, or ``default`` if unset.
 
     With ``allow_zero`` the value may be ``0`` (a disabled delay); otherwise it
     must be strictly positive. Booleans are rejected (``bool`` is an ``int``
     subclass in Python, so they'd slip through a plain numeric check).
+    ``section`` only names the table in the error, so the user is told which one
+    to go and fix.
     """
     value = table.get(key)
     if value is None:
@@ -280,5 +329,5 @@ def _seconds(table: dict, key: str, default: float, *, allow_zero: bool = False)
     )
     if invalid:
         wanted = "non-negative" if allow_zero else "positive"
-        raise ConfigError(f"config [remote] '{key}' must be a {wanted} number")
+        raise ConfigError(f"config [{section}] '{key}' must be a {wanted} number")
     return float(value)

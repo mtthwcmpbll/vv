@@ -7,7 +7,9 @@ import shutil
 import string
 import textwrap
 import threading
-from dataclasses import dataclass
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -25,6 +27,7 @@ from . import (
     pr,
     remote,
     skills,
+    state,
     summary,
     tmux_ops,
 )
@@ -329,6 +332,7 @@ def _launch_remote(
     ask: bool | None,
     name: str | None,
     pending_notes: "notes.Pending | None" = None,
+    watch: bool = False,
 ) -> None:
     """Forward this invocation to vv on the configured remote, inside a cmux tab.
 
@@ -347,6 +351,9 @@ def _launch_remote(
     # bare `vv` opens the remote TUI, which names its own sessions.
     session_name = name or (remote.gen_name() if (repo_url or chat) else None)
 
+    # The board belongs on the machine whose sessions it shows, so remote mode
+    # forwards it rather than opening a local board over an empty machine.
+
     forward: list[str] = []
     if session_name:
         forward += ["--name", session_name]
@@ -363,12 +370,14 @@ def _launch_remote(
         forward.append(f"--title={pending_notes.title}")
     for spec in (pending_notes.label_specs if pending_notes else ()):
         forward.append(f"--label={spec}")
+    if watch:
+        forward.append("--watch")
     if chat:
         forward.append("--chat")
     if repo_url:
         forward.append(repo_url)
 
-    title = session_name or remote_cfg.host
+    title = session_name or ("board" if watch else remote_cfg.host)
     remote.launch(remote_cfg, remote_argv=forward, title=title)
 
 
@@ -642,27 +651,47 @@ def _menu_list_sessions(default_agent: str, bypass: bool) -> None:
 
         note_store = notes.all_notes()
 
+        # Whose turn is it? The dot on each card, and the order the list is shown
+        # in, both come from this (see :mod:`vv.state`). It is classified from the
+        # PR statuses already in cache — a status that only lands later changes the
+        # dot at the next open, the same lag the PR cache already accepts, because
+        # re-sorting the list under the cursor mid-view would be worse than a
+        # slightly stale dot. `vv --watch` rebuilds wholesale and has no such lag.
+        git_facts = _git_facts(worktrees)
+        states = state.classify_all(
+            {
+                (repo, name): state.Facts(
+                    name=name,
+                    path=path,
+                    dirty=git_facts[(repo, name)][0],
+                    pr=pr_cached.get((repo, name)),
+                )
+                for repo, name, path in worktrees
+            },
+            windows=_state_windows(),
+        )
+        # Most-wants-you-first. `sorted` is stable, so sessions sharing a state
+        # keep the repo/newest-first order `_list_worktrees` gave them.
+        worktrees = sorted(worktrees, key=lambda w: states[(w[0], w[1])].rank)
+
         cards: list[dict] = []
         choices: list[questionary.Choice] = []
         card_by_key: dict[tuple[str, str], dict] = {}
         for repo, name, path in worktrees:
-            is_git = (path / ".git").exists()
             key = (repo, name)
-            note = note_store.get(notes.session_id(repo, name), notes.Note())
-            card = {
-                "running": name in live,
-                "title": note.title,          # user-set; sits above the summary
-                "summary": summaries.get(key),
-                "labels": note.labels,
-                # Ask git rather than assuming the session's name: a renamed
-                # branch is the readable one, and is what reviewers will see.
-                "branch": (_session_branch(path) or name) if is_git else None,
-                "dirty": _worktree_dirty(path) if is_git else False,
-                "folder": f"{repo}/{name}",
-                "pr": pr_cached.get(key),
-                "pr_pending": key in pr_stale,  # awaiting a background refresh
-                "when": _relative_time(_created_ts(path)),
-            }
+            dirty, branch = git_facts[key]
+            card = _session_card(
+                repo,
+                name,
+                path,
+                session_state=states[key],
+                note=note_store.get(notes.session_id(repo, name), notes.Note()),
+                summary_text=summaries.get(key),
+                dirty=dirty,
+                branch=branch,
+                pr_info=pr_cached.get(key),
+                pr_pending=key in pr_stale,
+            )
             cards.append(card)
             card_by_key[key] = card
             choices.append(questionary.Choice(title=f"{repo}/{name}", value=(repo, name, path)))
@@ -724,6 +753,506 @@ def _next_focus(
     return None
 
 
+# --- the live session board (`vv --watch`) -----------------------------------
+
+#: Narrowest a lane may get before side-by-side columns stop being readable —
+#: a card much below this truncates its own branch line. Under
+#: ``len(lanes) * this`` the board stacks its lanes vertically instead, so a
+#: narrow terminal gets one tall readable column rather than four cramped ones.
+_LANE_MIN_WIDTH = 38
+
+def _card_row_width(width: int) -> int:
+    """Total cells a rendered card row occupies at terminal width ``width``.
+
+    Mirrors :func:`_card_lines`' own clamp (including :data:`_CARD_MAX_WIDTH`) so
+    a lane's header and rule line up with the cards beneath them instead of
+    running the whole width of a wide terminal. The two cells it leaves spare are
+    the card's right margin, which doubles as the gap between columns.
+    """
+    card_width = max(
+        min(width - _CARD_GUTTER - _CARD_RIGHT_MARGIN, _CARD_MAX_WIDTH), 24
+    )
+    return _CARD_GUTTER + card_width
+
+
+@dataclass
+class _BoardModel:
+    """The board's data: every session, grouped into triage lanes.
+
+    Rebuilt wholesale on each refresh, which is affordable only because nothing
+    here runs an agent or blocks on the network: states come from one tmux call
+    plus mtime-memoized transcript reads, summaries are served from the cache the
+    session menu already writes (and are **never** regenerated — that would spawn
+    an agent process per session, on a timer), and PR statuses come from the
+    :class:`pr.Snapshot` cache with stale ones refetched in the background and
+    picked up by the following reload.
+    """
+
+    default_agent: str
+    lanes: list[tuple[str, list[dict]]] = field(default_factory=list)
+    refreshed_at: float = 0.0
+    _pr_thread: "threading.Thread | None" = None
+
+    def reload(self) -> None:
+        """Re-read every session and regroup the lanes. Safe to call off-thread."""
+        worktrees = _list_worktrees()
+        paths = {(repo, name): path for repo, name, path in worktrees}
+        git_facts = _git_facts(worktrees)
+
+        snapshot = pr.Snapshot(paths)
+        pr_cached, pr_stale = snapshot.cached, snapshot.stale_keys
+        # Refetch stale PR statuses in the background — they land in the shared
+        # on-disk cache and the next reload picks them up. One refresh at a time,
+        # so a slow `gh` can't stack up threads on a board left open all day.
+        if pr_stale and (self._pr_thread is None or not self._pr_thread.is_alive()):
+            self._pr_thread = snapshot.refresh(lambda _key, _pr: None)
+
+        states = state.classify_all(
+            {
+                key: state.Facts(
+                    name=key[1],
+                    path=path,
+                    dirty=git_facts[key][0],
+                    pr=pr_cached.get(key),
+                )
+                for key, path in paths.items()
+            },
+            windows=_state_windows(),
+        )
+
+        note_store = notes.all_notes()
+        summaries = summary.load_cache()
+
+        grouped: dict[str, list[dict]] = {name: [] for name in state.ORDER}
+        for repo, name, path in worktrees:
+            key = (repo, name)
+            dirty, branch = git_facts[key]
+            session_id = notes.session_id(repo, name)
+            grouped.setdefault(states[key].state, []).append(
+                _session_card(
+                    repo,
+                    name,
+                    path,
+                    session_state=states[key],
+                    note=note_store.get(session_id, notes.Note()),
+                    summary_text=(summaries.get(session_id) or {}).get("summary"),
+                    dirty=dirty,
+                    branch=branch,
+                    pr_info=pr_cached.get(key),
+                    pr_pending=key in pr_stale,
+                )
+            )
+
+        # Lanes in triage order, empty ones dropped so the board shows what is
+        # actually there — except "needs you", which is kept even when empty:
+        # "nothing is waiting on you" is the single most useful thing the board
+        # can say, and it can only say it by leaving the lane visible.
+        self.lanes = [
+            (name, grouped.get(name, []))
+            for name in state.ORDER
+            if grouped.get(name) or name == state.NEEDS_YOU
+        ]
+        self.refreshed_at = time.time()
+
+    def flat(self) -> list[tuple[int, int]]:
+        """Every card as ``(lane_index, card_index)``, in board order."""
+        return _flat_positions(self.lanes)
+
+    def card(self, position: tuple[int, int]) -> dict:
+        """The card at a ``(lane_index, card_index)`` position."""
+        return _card_at(self.lanes, position)
+
+    @property
+    def total(self) -> int:
+        """How many sessions the board is showing."""
+        return sum(len(cards) for _name, cards in self.lanes)
+
+
+#: A board layout: ``[(state_name, [card, ...]), ...]``.
+Lanes = list[tuple[str, list[dict]]]
+
+
+def _flat_positions(lanes: Lanes) -> list[tuple[int, int]]:
+    """Every card in ``lanes`` as ``(lane_index, card_index)``, in board order."""
+    return [
+        (lane_index, card_index)
+        for lane_index, (_name, cards) in enumerate(lanes)
+        for card_index in range(len(cards))
+    ]
+
+
+def _card_at(lanes: Lanes, position: tuple[int, int]) -> dict:
+    """The card at a ``(lane_index, card_index)`` position within ``lanes``."""
+    return lanes[position[0]][1][position[1]]
+
+
+def _pad_row(segments: list[tuple[str, str]], width: int) -> list[tuple[str, str]]:
+    """Pad a row of style segments out to exactly ``width`` visible cells.
+
+    The padding is deliberately unstyled: it sits *outside* the card's border, so
+    washing it with the selection background would smear the highlight across the
+    gap between columns.
+    """
+    visible = sum(len(text) for _style, text in segments)
+    if visible >= width:
+        return segments
+    return [*segments, ("", " " * (width - visible))]
+
+
+def _lane_rows(
+    name: str,
+    cards: list[dict],
+    width: int,
+    selected: int | None,
+    theme: CardTheme,
+) -> tuple[list[list[tuple[str, str]]], int | None]:
+    """Render one lane — header, rule, cards — as rows exactly ``width`` wide.
+
+    Returns the rows plus the index of the row that should carry prompt_toolkit's
+    cursor sentinel (the selected card's middle row, so scrolling keeps the whole
+    card on screen), or ``None`` when the selection is in another lane.
+    """
+    g = theme.glyphs
+    rows: list[list[tuple[str, str]]] = []
+    cursor_row: int | None = None
+
+    # Header and rule span the cards, not the terminal: on a wide screen the
+    # cards stop at _CARD_MAX_WIDTH and a full-width rule would float over them.
+    inner = _card_row_width(width)
+    count = str(len(cards))
+    title = _fit(
+        f"{g.get(name, '')} {state.LABELS.get(name, name)}".strip(),
+        max(0, inner - len(count) - 1),
+    )
+    gap = max(1, inner - len(title) - len(count))
+    rows.append(
+        _pad_row(
+            [
+                (f"class:card.state.{name}", title),
+                ("", " " * gap),
+                ("class:board.count", count),
+            ],
+            width,
+        )
+    )
+    rows.append(_pad_row([("class:board.rule", "─" * inner)], width))
+
+    if not cards:
+        rows.append(_pad_row([("class:board.empty", "  nothing here")], width))
+
+    for index, card in enumerate(cards):
+        is_selected = index == selected
+        lines = _card_lines(card, width, theme)
+        middle = len(lines) // 2
+        for row_number, row in enumerate(lines):
+            if is_selected and row_number == middle:
+                cursor_row = len(rows)
+            if is_selected:
+                gutter = f"{g['select_pointer']} " if row_number == 0 else f"{g['select_bar']} "
+            else:
+                gutter = "  "
+            segments: list[tuple[str, str]] = [(_sel("class:card.bar", is_selected), gutter)]
+            segments.extend((_sel(style, is_selected), text) for style, text in row)
+            rows.append(_pad_row(segments, width))
+        rows.append(_pad_row([], width))  # breathing room between cards
+
+    return rows, cursor_row
+
+
+def _lane_selection(cursor: tuple[int, int] | None, lane_index: int) -> int | None:
+    """The selected card index within ``lane_index``, or ``None`` if elsewhere."""
+    if cursor is None or cursor[0] != lane_index:
+        return None
+    return cursor[1]
+
+
+def _board_rows(
+    lanes: Lanes, cursor: tuple[int, int] | None, width: int, theme: CardTheme
+) -> tuple[list[list[tuple[str, str]]], int | None]:
+    """Lay the lanes out as columns if they fit, else stacked vertically.
+
+    Takes a lanes *snapshot* rather than the model: the board's refresh thread
+    swaps ``model.lanes`` wholesale at any moment, and a renderer that re-read it
+    between computing the cursor and drawing could index a list that no longer
+    matches.
+    """
+    if not lanes:
+        return [[("class:board.empty", "  No sessions yet.")]], None
+
+    usable = max(width, _LANE_MIN_WIDTH)
+    if usable >= len(lanes) * _LANE_MIN_WIDTH:
+        lane_width = usable // len(lanes)
+        rendered = [
+            _lane_rows(name, cards, lane_width, _lane_selection(cursor, index), theme)
+            for index, (name, cards) in enumerate(lanes)
+        ]
+        height = max(len(rows) for rows, _cursor in rendered)
+        blank = [("", " " * lane_width)]
+        cursor_row = next((c for _rows, c in rendered if c is not None), None)
+        combined = [
+            [
+                segment
+                for rows, _cursor in rendered
+                for segment in (rows[index] if index < len(rows) else blank)
+            ]
+            for index in range(height)
+        ]
+        return combined, cursor_row
+
+    # Too narrow for columns: stack the lanes, one under the other.
+    combined: list[list[tuple[str, str]]] = []
+    cursor_row = None
+    for index, (name, cards) in enumerate(lanes):
+        if combined:
+            # Padded, not empty: every row the board emits is the same width, so
+            # a caller (and the column path above) can rely on that.
+            combined.append(_pad_row([], usable))  # blank line between lanes
+        rows, lane_cursor = _lane_rows(
+            name, cards, usable, _lane_selection(cursor, index), theme
+        )
+        if lane_cursor is not None:
+            cursor_row = len(combined) + lane_cursor
+        combined.extend(rows)
+    return combined, cursor_row
+
+
+def _board_tokens(
+    lanes: Lanes, cursor: tuple[int, int] | None, width: int, theme: CardTheme
+) -> list[tuple[str, str]]:
+    """The board as a prompt_toolkit formatted-text token stream."""
+    rows, cursor_row = _board_rows(lanes, cursor, width, theme)
+    tokens: list[tuple[str, str]] = []
+    for index, row in enumerate(rows):
+        if index == cursor_row:
+            tokens.append(("[SetCursorPosition]", ""))
+        tokens.extend(row)
+        tokens.append(("", "\n"))
+    return tokens
+
+
+def _run_board(
+    model: _BoardModel, theme: CardTheme, refresh: float
+) -> tuple[str, dict | None]:
+    """Run the live board until the user acts; return ``(action, card)``.
+
+    A daemon thread reloads the model every ``refresh`` seconds and repaints
+    (``invalidate`` is thread-safe), so the board keeps up with sessions changing
+    under it without the user touching anything. Actions —
+    ``"resume"`` / ``"delete"`` / ``"quit"`` — are returned rather than performed,
+    because both of the first two need the terminal back: resuming hands it to
+    tmux, and deleting prompts for confirmation.
+
+    The cursor follows the *session*, not the slot: it is remembered by folder,
+    so a reload that re-lanes a session (it finished, it started asking) keeps the
+    cursor on it instead of dumping it wherever that index now points.
+    """
+    from prompt_toolkit.application import Application
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.layout import Layout
+    from prompt_toolkit.layout.containers import HSplit, Window
+    from prompt_toolkit.layout.controls import FormattedTextControl
+
+    selected: dict[str, str | None] = {"folder": None}
+
+    def index_in(lanes: Lanes, positions: list[tuple[int, int]]) -> int | None:
+        """Where the remembered session sits in this snapshot's order."""
+        if not positions:
+            return None
+        if selected["folder"] is not None:
+            for index, position in enumerate(positions):
+                if _card_at(lanes, position)["folder"] == selected["folder"]:
+                    return index
+        return 0
+
+    def cursor_in(lanes: Lanes) -> tuple[int, int] | None:
+        positions = _flat_positions(lanes)
+        index = index_in(lanes, positions)
+        return positions[index] if index is not None else None
+
+    def remember(index: int) -> None:
+        lanes = model.lanes
+        positions = _flat_positions(lanes)
+        if positions:
+            index = max(0, min(len(positions) - 1, index))
+            selected["folder"] = _card_at(lanes, positions[index])["folder"]
+
+    def pointed() -> dict | None:
+        lanes = model.lanes
+        position = cursor_in(lanes)
+        return _card_at(lanes, position) if position is not None else None
+
+    def tokens() -> list[tuple[str, str]]:
+        lanes = model.lanes  # one snapshot: the refresh thread may swap it
+        return _board_tokens(
+            lanes, cursor_in(lanes), shutil.get_terminal_size().columns, theme
+        )
+
+    def status() -> list[tuple[str, str]]:
+        counts = "   ".join(
+            f"{state.LABELS.get(name, name)} {len(cards)}" for name, cards in model.lanes
+        )
+        updated = _relative_time(model.refreshed_at) if model.refreshed_at else "…"
+        return [
+            ("class:board.status", f" {counts}"),
+            ("class:board.status", f"   ·   updated {updated}"),
+        ]
+
+    def keys() -> list[tuple[str, str]]:
+        return [
+            ("class:board.key", " ↑↓"),
+            ("class:board.status", " move  "),
+            ("class:board.key", "←→"),
+            ("class:board.status", " lane  "),
+            ("class:board.key", "enter"),
+            ("class:board.status", " resume  "),
+            ("class:board.key", "x"),
+            ("class:board.status", " delete  "),
+            ("class:board.key", "r"),
+            ("class:board.status", " refresh  "),
+            ("class:board.key", "q"),
+            ("class:board.status", " quit"),
+        ]
+
+    bindings = KeyBindings()
+
+    def move(delta: int) -> None:
+        lanes = model.lanes
+        index = index_in(lanes, _flat_positions(lanes))
+        if index is not None:
+            remember(index + delta)
+
+    @bindings.add("up")
+    @bindings.add("k")
+    def _up(_event) -> None:
+        move(-1)
+
+    @bindings.add("down")
+    @bindings.add("j")
+    def _down(_event) -> None:
+        move(1)
+
+    def jump_lane(delta: int) -> None:
+        """Move to the top of the lane ``delta`` away, if there is one."""
+        lanes = model.lanes
+        position = cursor_in(lanes)
+        if position is None:
+            return
+        target = position[0] + delta
+        for index, (lane_index, card_index) in enumerate(_flat_positions(lanes)):
+            if lane_index == target and card_index == 0:
+                remember(index)
+                return
+
+    @bindings.add("left")
+    @bindings.add("h")
+    def _left(_event) -> None:
+        jump_lane(-1)
+
+    @bindings.add("right")
+    @bindings.add("l")
+    def _right(_event) -> None:
+        jump_lane(1)
+
+    @bindings.add("enter")
+    def _resume(event) -> None:
+        card = pointed()
+        if card is not None:
+            event.app.exit(result=("resume", card))
+
+    @bindings.add("x")
+    def _delete(event) -> None:
+        card = pointed()
+        if card is not None:
+            event.app.exit(result=("delete", card))
+
+    @bindings.add("r")
+    def _refresh(event) -> None:
+        threading.Thread(target=_reload_once, args=(event.app,), daemon=True).start()
+
+    @bindings.add("q")
+    @bindings.add("c-c")
+    @bindings.add("c-d")
+    def _quit(event) -> None:
+        event.app.exit(result=("quit", None))
+
+    def _reload_once(app) -> None:
+        try:
+            model.reload()
+        except Exception:  # noqa: BLE001 — a failed refresh must not kill the board
+            pass
+        app.invalidate()
+
+    application = Application(
+        layout=Layout(
+            HSplit(
+                [
+                    Window(
+                        FormattedTextControl(tokens, focusable=True, show_cursor=False),
+                        wrap_lines=False,
+                    ),
+                    Window(height=1, char="─", style="class:board.rule"),
+                    Window(FormattedTextControl(status), height=1),
+                    Window(FormattedTextControl(keys), height=1),
+                ]
+            )
+        ),
+        key_bindings=bindings,
+        style=_card_style(theme),
+        full_screen=True,
+        mouse_support=False,
+    )
+
+    stop = threading.Event()
+
+    def refresher() -> None:
+        while not stop.wait(refresh):
+            _reload_once(application)
+
+    threading.Thread(target=refresher, daemon=True).start()
+    try:
+        result = application.run()
+    finally:
+        stop.set()
+    return result or ("quit", None)
+
+
+def _watch_board(default_agent: str, bypass: bool) -> None:
+    """Open the live session board: every session, grouped by whose turn it is.
+
+    The board is the answer to having more sessions than attention. The session
+    menu is something you open when you remember to; this is something you leave
+    open in a tab and glance at, and it re-reads the world on a timer so the
+    glance is always current.
+
+    Resuming or deleting drops out of the board to do its work (both need the
+    terminal); a delete comes back to a rebuilt board, so a run of finished
+    sessions can be cleared in one sitting.
+    """
+    theme = _card_theme()
+    refresh = config.configured_board().refresh
+    model = _BoardModel(default_agent=default_agent)
+    typer.secho("Reading sessions...", fg=typer.colors.CYAN)
+    model.reload()
+
+    while True:
+        if not model.total:
+            typer.secho(
+                "No sessions yet. Run `vv <repo-url>` to start one.",
+                fg=typer.colors.YELLOW,
+            )
+            return
+        action, card = _run_board(model, theme, refresh)
+        if action == "quit" or card is None:
+            return
+        live = set(tmux_ops.list_sessions())
+        if action == "resume":
+            _resume_session(card["name"], card["path"], default_agent, live, bypass)
+            return
+        if action == "delete":
+            _delete_session(card["repo"], card["name"], card["path"], live)
+            model.reload()
+
+
 # --- installing vv's bundled skills into the agent CLIs ----------------------
 
 
@@ -757,7 +1286,7 @@ def _install_skills() -> None:
         for skill in bundled
         for target in found
     ]
-    conflicts = [(skill, target) for skill, target, state in plan if state == "differs"]
+    conflicts = [(skill, target) for skill, target, status in plan if status == "differs"]
 
     overwrite = True
     if conflicts:
@@ -769,11 +1298,11 @@ def _install_skills() -> None:
         )
 
     installed = 0
-    for skill, target, state in plan:
-        if state == "same":
+    for skill, target, status in plan:
+        if status == "same":
             typer.secho(f"  = {target.label}: {skill} already up to date", fg=typer.colors.CYAN)
             continue
-        if state == "differs" and not overwrite:
+        if status == "differs" and not overwrite:
             typer.secho(f"  - {target.label}: {skill} kept as-is", fg=typer.colors.YELLOW)
             continue
         try:
@@ -781,7 +1310,7 @@ def _install_skills() -> None:
         except OSError as exc:  # a read-only or otherwise unwritable root
             typer.secho(f"  ! {target.label}: {skill} failed — {exc}", fg=typer.colors.RED)
             continue
-        verb = "updated" if state == "differs" else "installed"
+        verb = "updated" if status == "differs" else "installed"
         typer.secho(f"  + {target.label}: {verb} {path}", fg=typer.colors.GREEN)
         installed += 1
 
@@ -982,8 +1511,12 @@ _CARD_MAX_WIDTH = 74
 #: so the layout stays aligned (``separator`` is the exception — it carries its
 #: own spaces).
 _DEFAULT_GLYPHS: dict[str, str] = {
-    "running": "▸",        # live session (filled right triangle)
-    "idle": "▹",           # idle session (outline right triangle)
+    "needs_you": "◆",      # the agent stopped and it is your move
+    "stopped": "✕",        # tmux session alive, agent exited
+    "working": "▸",        # the agent is producing output (filled triangle)
+    "review": "◇",         # pushed, PR open — CI/reviewers have it
+    "idle": "▹",           # nothing pending (outline triangle)
+    "detail": "↳ ",        # prefix on the agent's last words, under the headline
     "dirty": "✱",          # uncommitted/unpushed marker after the branch
     "separator": " · ",    # between branch and folder
     "label": "#",          # prefix on each user-assigned label
@@ -1007,8 +1540,12 @@ _DEFAULT_GLYPHS: dict[str, str] = {
 _DEFAULT_COLORS: dict[str, str] = {
     "border": "ansibrightblack",
     "bar": "ansicyan bold",
-    "running": "ansigreen bold",
+    "needs_you": "ansiyellow bold",
+    "stopped": "ansired",
+    "working": "ansigreen bold",
+    "review": "ansicyan",
     "idle": "ansibrightblack",
+    "detail": "ansiyellow",
     "title": "bold",
     "summary": "ansibrightblack",  # generated summary, under a user-set title
     "label": "ansimagenta",
@@ -1038,6 +1575,80 @@ class CardTheme:
 
 #: Theme with everything at its default; the fallback when no config overrides.
 _DEFAULT_THEME = CardTheme(_DEFAULT_GLYPHS, _DEFAULT_COLORS)
+
+
+#: Cap on concurrent ``git`` probes when gathering session facts.
+_GIT_WORKERS = 8
+
+
+def _git_facts(
+    worktrees: list[tuple[str, str, Path]],
+) -> dict[tuple[str, str], tuple[bool, str | None]]:
+    """``(dirty, branch)`` for every session, gathered in parallel.
+
+    Each git-backed session costs two or three ``git`` subprocesses, and the
+    board re-reads all of them on a timer — a pool keeps a thirty-session refresh
+    from walking through ninety sequential processes. Chat sessions answer
+    ``(False, None)`` without touching git at all.
+    """
+    if not worktrees:
+        return {}
+
+    def facts(item: tuple[str, str, Path]) -> tuple[bool, str | None]:
+        _repo, name, path = item
+        if not (path / ".git").exists():
+            return False, None
+        # The branch is asked of git, not assumed from the name: a PR flow may
+        # have renamed it to something readable.
+        return _worktree_dirty(path), _session_branch(path) or name
+
+    with ThreadPoolExecutor(max_workers=min(len(worktrees), _GIT_WORKERS)) as pool:
+        gathered = list(pool.map(facts, worktrees))
+    return {
+        (repo, name): result
+        for (repo, name, _path), result in zip(worktrees, gathered)
+    }
+
+
+def _session_card(
+    repo: str,
+    name: str,
+    path: Path,
+    *,
+    session_state: "state.SessionState",
+    note: "notes.Note",
+    summary_text: str | None,
+    dirty: bool,
+    branch: str | None,
+    pr_info: dict | None,
+    pr_pending: bool,
+) -> dict:
+    """Assemble one session's card dict.
+
+    Shared by the list menu and the live board so the two can never drift into
+    describing the same session differently.
+    """
+    return {
+        "state": session_state,     # drives the dot, the ordering and the detail
+        "title": note.title,        # user-set; sits above the summary
+        "summary": summary_text,
+        "labels": note.labels,
+        "branch": branch,           # None for a chat session (no git)
+        "dirty": dirty,
+        "folder": f"{repo}/{name}",
+        "repo": repo,
+        "name": name,
+        "path": path,
+        "pr": pr_info,
+        "pr_pending": pr_pending,   # awaiting a background refresh
+        "when": _relative_time(_created_ts(path)),
+    }
+
+
+def _state_windows() -> state.Windows:
+    """The triage windows (see :class:`vv.state.Windows`) from ``[board]`` config."""
+    board = config.configured_board()
+    return state.Windows(active=board.active_window, stale=board.stale_after)
 
 
 def _card_theme() -> CardTheme:
@@ -1094,10 +1705,37 @@ def _worktree_dirty(path: Path) -> bool:
         return False
 
 
+def _fit(text: str, width: int) -> str:
+    """Truncate ``text`` to ``width`` cells, marking any cut with an ellipsis."""
+    if width <= 0:
+        return ""
+    return text if len(text) <= width else text[: max(0, width - 1)] + "…"
+
+
+def _fit_segments(
+    segments: list[tuple[str, str]], width: int
+) -> list[tuple[str, str]]:
+    """Truncate a row of style segments to ``width`` visible cells.
+
+    A row is otherwise free to overrun its card — a long ``branch · repo/name``
+    is the usual culprit — which merely clipped at the terminal edge in the
+    single-column list, but on the board would shear every column to its right.
+    """
+    kept: list[tuple[str, str]] = []
+    used = 0
+    for style, text in segments:
+        if used + len(text) <= width:
+            kept.append((style, text))
+            used += len(text)
+            continue
+        if width > used:
+            kept.append((style, _fit(text, width - used)))
+        break
+    return kept
+
+
 def _relative_time(ts: float) -> str:
     """Format a Unix timestamp as a compact relative age, e.g. ``3d ago``."""
-    import time
-
     secs = max(0.0, time.time() - ts)
     for unit, size in (("w", 604800), ("d", 86400), ("h", 3600), ("m", 60)):
         if secs >= size:
@@ -1163,14 +1801,19 @@ def _card_lines(
     border = "class:card.border"
 
     def content_row(segments: list[tuple[str, str]]) -> list[tuple[str, str]]:
+        segments = _fit_segments(segments, inner)
         visible = sum(len(text) for _style, text in segments)
         pad = " " * max(0, inner - visible)
         return [(border, "│ "), *segments, ("", pad), (border, " │")]
 
     rows: list[list[tuple[str, str]]] = [[(border, "╭" + "─" * (card_width - 2) + "╮")]]
 
-    dot_style = "class:card.dot.run" if card["running"] else "class:card.dot.idle"
-    dot = g["running"] if card["running"] else g["idle"]
+    # The dot is the card's triage signal: which of the five states this session
+    # is in (see :mod:`vv.state`). Cards built without one — older callers, tests
+    # — fall back to idle rather than crashing on a missing key.
+    session_state = card.get("state") or state.SessionState(state.IDLE)
+    dot = g.get(session_state.state, g["idle"])
+    dot_style = f"class:card.state.{session_state.state}"
 
     # The headline is the user's own title when they set one, else the generated
     # summary; the dot leads it. A title doesn't replace the summary — the
@@ -1186,6 +1829,23 @@ def _card_lines(
         first = False
     for line in body_lines:
         rows.append(content_row([("", "  "), ("class:card.summary", line)]))
+
+    # For a session waiting on you, the agent's own last words beat any summary:
+    # "Should I also update the tests?" says what to do, "Refactoring the auth
+    # flow" does not. Truncated to one line rather than wrapped, so a chatty
+    # agent can't inflate the card.
+    if session_state.detail:
+        rows.append(
+            content_row(
+                [
+                    ("", "  "),
+                    (
+                        "class:card.detail",
+                        _fit(f"{g['detail']}{session_state.detail}", inner - 2),
+                    ),
+                ]
+            )
+        )
 
     # User-assigned labels sit just under the title, indented to line up with it.
     chips = g["label_gap"].join(
@@ -1293,8 +1953,16 @@ def _card_style(theme: "CardTheme | None" = None):
     rules = [
         ("card.border", c["border"]),
         ("card.bar", c["bar"]),
-        ("card.dot.run", c["running"]),
-        ("card.dot.idle", c["idle"]),
+        *(
+            (f"card.state.{name}", c[name])
+            for name in (state.NEEDS_YOU, state.STOPPED, state.WORKING, state.REVIEW, state.IDLE)
+        ),
+        ("card.detail", c["detail"]),
+        ("board.rule", c["border"]),
+        ("board.count", c["folder"]),
+        ("board.status", c["folder"]),
+        ("board.key", c["branch"]),
+        ("board.empty", c["idle"]),
         ("card.title", c["title"]),
         ("card.summary", c["summary"]),
         ("card.label", c["label"]),
@@ -1911,6 +2579,7 @@ def _interactive_menu(default_agent: str, bypass: bool) -> None:
     """Top-level menu shown when vv is invoked with no arguments."""
     _banner()
     actions = {
+        "◆  Live session board (who needs you)": _watch_board,
         "●  List existing sessions": _menu_list_sessions,
         "➥  Start a new session from an existing repo": _menu_new_from_repo,
         "✚  Add a new repo": _menu_add_repo,
@@ -1986,6 +2655,14 @@ def main(
         "(use --label=-TAG). On its own it labels the session you are in (or "
         "--name NAME); alongside a repo URL or --chat it labels the new session.",
     ),
+    watch: bool = typer.Option(
+        False,
+        "--watch",
+        "-w",
+        help="Open the live session board: every session grouped by whose turn "
+        "it is (needs you / stopped / working / in review / idle), refreshed on "
+        "a timer. Cannot be combined with a repo URL or --chat.",
+    ),
     install_skills: bool = typer.Option(
         False,
         "--skills",
@@ -2040,13 +2717,20 @@ def main(
             _apply_notes(pending_notes, name)
             return
 
+        # Checked before the mode split so the message is the same whether the
+        # session would have been made here or on the remote.
+        if watch and (repo_url or chat):
+            raise _fail("--watch cannot be combined with a repo URL or --chat")
+
         if mode == "remote":
             if chat and repo_url:
                 raise _fail("--chat cannot be combined with a repo URL")
-            _launch_remote(repo_url, chat, agent, ask, name, pending_notes)
+            _launch_remote(repo_url, chat, agent, ask, name, pending_notes, watch)
             return
 
-        if chat:
+        if watch:
+            _watch_board(resolved_agent, bypass)
+        elif chat:
             if repo_url:
                 raise _fail("--chat cannot be combined with a repo URL")
             _new_chat_session(resolved_agent, bypass, name, pending_notes)

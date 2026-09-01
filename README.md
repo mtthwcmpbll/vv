@@ -19,6 +19,8 @@ Given a git repository URL, `vv`:
 
 Run with no arguments for an interactive menu:
 
+- **Live session board** — every session grouped by whose turn it is (see
+  below). Also `vv --watch`.
 - **List existing sessions** — pick a worktree, then choose to **resume** it
   (re-attach to its tmux session, or start a fresh one) or **delete** it.
   Deleting a worktree with uncommitted changes or unpushed commits warns you
@@ -32,6 +34,49 @@ Run with no arguments for an interactive menu:
   its visibility; `vv` creates it with `gh`, clones it, and drops you into a
   session exactly as if the repo had already existed. Needs the
   [`gh` CLI](https://cli.github.com) installed and logged in.
+
+## The session board (`vv --watch`)
+
+Past a handful of sessions the question stops being *what is this one?* and
+becomes **which one is waiting on me?** `vv --watch` answers that: a live board
+that groups every session into a lane by whose turn it is, and re-reads the
+world on a timer so a glance is always current.
+
+```
+◆ Needs you              2   ▸ Working            1   ◇ In review          1
+──────────────────────────   ──────────────────────   ──────────────────────
+❯ ╭────────────────────────╮   ╭────────────────────╮   ╭────────────────────╮
+▌ │ ◆ Adding the state axis│   │ ▸ Refactoring cards│   │ ◇ Rate limiter     │
+▌ │   ↳ Should I also upda…│   │ swift-heron · vv/… │   │ lucky-ibis · api/… │
+▌ │ brave-falcon✱ · vv/br… │   │ ○ no open PR  2m   │   │ ○ PR #42 ✓ passing │
+▌ ╰────────────────────────╯   ╰────────────────────╯   ╰────────────────────╯
+```
+
+Five lanes, ordered by how much they want from you:
+
+| Lane | Means |
+| --- | --- |
+| `◆` **Needs you** | The agent stopped talking and it is your move |
+| `✕` **Stopped** | The tmux session is alive but the agent has exited |
+| `▸` **Working** | The agent is producing output right now |
+| `◇` **In review** | Pushed, PR open — CI and reviewers have it |
+| `▹` **Idle** | Nothing pending |
+
+Two things make this more than a list. A session in **Needs you** shows the
+agent's own last words (`↳ Should I also update the tests?`) — what it wants
+beats a summary of what it was doing. And **Needs you expires**: an agent that
+stopped an hour ago is waiting on you, one that stopped last Tuesday is
+abandoned, so after `stale_after` (24h by default) a session drops into Idle
+where the stale sweep can clean it up. The lane holds today's work, not
+everything you ever started.
+
+Keys: `↑↓` move, `←→` jump lane, `enter` resume, `x` delete, `r` refresh now,
+`q` quit. The board lays lanes out side by side when the terminal is wide enough
+and stacks them when it is not. It never runs an agent — summaries are served
+from the cache the session list writes — so leaving it open all day is cheap.
+
+The same states drive the dot on every session card, and the session list is
+ordered by them too, so it reads as a queue rather than a pile.
 
 ## Titles and labels
 
@@ -143,6 +188,7 @@ vv https://github.com/owner/repo.git   # clone + new worktree session
 vv git@github.com:owner/repo.git       # scp-style URLs work too
 vv --agent codex                       # choose the agent CLI for this run
 vv -t "Acme onboarding" -l acme        # title/label the session you're in
+vv --watch                             # live board: who needs you
 vv                                     # interactive menu
 ```
 
@@ -154,3 +200,14 @@ vv                                     # interactive menu
 | `WORKTREES_DIR`  | `~/.vv/worktrees`      | Per-session worktrees, grouped by repo |
 | `VV_CONFIG`      | `~/.vv/config.toml`    | TOML config file (`agent`, `ask` keys) |
 | `VV_AGENT`       | `claude`               | Agent CLI to launch (`--agent` wins)   |
+
+Board timing lives in a `[board]` table, and the two windows also decide the
+dot on every session card:
+
+```toml
+# ~/.vv/config.toml
+[board]
+refresh = 10          # seconds between board refreshes
+active_window = 60    # quiet longer than this and a session stops being "working"
+stale_after = 86400   # quiet longer than this and it stops asking for attention
+```

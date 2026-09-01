@@ -299,3 +299,35 @@ def test_configured_remote_rejects_bad_ssh_options(monkeypatch, tmp_path):
     _use_config(monkeypatch, tmp_path, '[remote]\nhost = "h"\nssh_options = "nope"\n')
     with pytest.raises(config.ConfigError):
         config.configured_remote()
+
+
+# --- configured_board -------------------------------------------------------
+
+def test_configured_board_defaults_without_a_table(monkeypatch, tmp_path):
+    _use_config(monkeypatch, tmp_path, 'agent = "claude"\n')
+    assert config.configured_board() == config.Board()
+
+
+def test_configured_board_reads_overrides(monkeypatch, tmp_path):
+    _use_config(
+        monkeypatch,
+        tmp_path,
+        "[board]\nrefresh = 3\nactive_window = 30\nstale_after = 7200\n",
+    )
+    board = config.configured_board()
+    assert (board.refresh, board.active_window, board.stale_after) == (3.0, 30.0, 7200.0)
+
+
+def test_configured_board_partial_table_keeps_other_defaults(monkeypatch, tmp_path):
+    _use_config(monkeypatch, tmp_path, "[board]\nrefresh = 2\n")
+    board = config.configured_board()
+    assert board.refresh == 2.0
+    assert board.stale_after == config.Board().stale_after
+
+
+@pytest.mark.parametrize("value", ["0", "-5", '"soon"', "true"])
+def test_configured_board_rejects_nonsense(monkeypatch, tmp_path, value):
+    # A board that silently refuses to refresh reads as a bug in vv, not a typo.
+    _use_config(monkeypatch, tmp_path, f"[board]\nrefresh = {value}\n")
+    with pytest.raises(config.ConfigError, match=r"\[board\] 'refresh'"):
+        config.configured_board()

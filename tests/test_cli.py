@@ -9,7 +9,10 @@ from __future__ import annotations
 import pytest
 from typer.testing import CliRunner
 
+from pathlib import Path
+
 from vv import cli
+from vv.state import IDLE, NEEDS_YOU, REVIEW, STOPPED, WORKING, SessionState
 
 runner = CliRunner()
 _REPO_URL = "https://example.com/owner/repo.git"
@@ -280,6 +283,9 @@ def sessions_menu(monkeypatch, tmp_path):
     monkeypatch.setattr(cli, "_worktree_dirty", lambda p: False)
     monkeypatch.setattr(cli.notes, "all_notes", lambda: {})
     monkeypatch.setattr(cli.pr, "Snapshot", lambda paths: _StubSnapshot())
+    # Keep triage classification off the real tmux server and ~/.claude.
+    monkeypatch.setattr(cli.tmux_ops, "session_activity", lambda *a, **k: {})
+    monkeypatch.setattr(cli.state, "_safe_last_turn", lambda p: None)
 
     def fake_pick(message, choices, cards, *a, focus=None, **kw):
         state["renders"] += 1
@@ -1728,7 +1734,7 @@ def _plain(rows):
 
 def _git_card(**over):
     card = {
-        "running": False, "summary": "Refactoring the auth flow",
+        "state": SessionState(IDLE), "summary": "Refactoring the auth flow",
         "branch": "breezy", "folder": "repo/breezy", "pr": None, "when": "2h ago",
     }
     card.update(over)
@@ -1807,9 +1813,37 @@ def test_card_lines_branch_shows_dirty_asterisk():
     assert "breezy✱ · repo/breezy" in dirty  # ✱ sits between branch and separator
 
 
-def test_card_lines_running_dot_and_chat_without_branch():
-    running = _plain(cli._card_lines(_git_card(running=True), width=54))
-    assert "▸ Refactoring the auth flow" in running[1]          # filled triangle when live
+def test_card_lines_dot_reflects_triage_state():
+    # The dot is the card's triage signal: one glyph per state, not "is tmux up".
+    for name, glyph in (
+        (WORKING, "▸"), (NEEDS_YOU, "◆"), (STOPPED, "✕"),
+        (REVIEW, "◇"), (IDLE, "▹"),
+    ):
+        rows = _plain(cli._card_lines(_git_card(state=SessionState(name)), width=54))
+        assert f"{glyph} Refactoring the auth flow" in rows[1]
+
+
+def test_card_lines_shows_agents_last_words_for_needs_you():
+    # A waiting session's most useful line is what the agent actually asked.
+    rows = _plain(cli._card_lines(
+        _git_card(state=SessionState(NEEDS_YOU, "Should I update the tests?")),
+        width=54,
+    ))
+    assert "↳ Should I update the tests?" in rows[2]
+    # ...and nothing extra is drawn when there is no detail to show.
+    plain = _plain(cli._card_lines(_git_card(state=SessionState(IDLE)), width=54))
+    assert not any("↳" in row for row in plain)
+
+
+def test_card_lines_detail_truncates_rather_than_wrapping():
+    rows = _plain(cli._card_lines(
+        _git_card(state=SessionState(NEEDS_YOU, "x" * 300)), width=54
+    ))
+    assert sum("↳" in row for row in rows) == 1   # one line, never a paragraph
+    assert "…" in rows[2]
+
+
+def test_card_lines_chat_without_branch():
 
     chat = _plain(cli._card_lines(
         _git_card(branch=None, folder="_chats/spark", summary="Scratch space"), width=54
@@ -1895,10 +1929,10 @@ def test_keep_card_visible_sets_scroll_offsets():
 def test_card_theme_merges_config_over_defaults(monkeypatch):
     from vv import config
 
-    monkeypatch.setattr(config, "configured_card_glyphs", lambda: {"running": ">", "chat": "🗨"})
+    monkeypatch.setattr(config, "configured_card_glyphs", lambda: {"working": ">", "chat": "🗨"})
     monkeypatch.setattr(config, "configured_card_colors", lambda: {"branch": "#ff8800"})
     theme = cli._card_theme()
-    assert theme.glyphs["running"] == ">"          # overridden
+    assert theme.glyphs["working"] == ">"          # overridden
     assert theme.glyphs["idle"] == cli._DEFAULT_GLYPHS["idle"]   # untouched default
     assert theme.colors["branch"] == "#ff8800"     # overridden
     assert theme.colors["pr_fail"] == cli._DEFAULT_COLORS["pr_fail"]
@@ -1916,10 +1950,13 @@ def test_card_theme_drops_malformed_colors(monkeypatch):
 
 def test_render_honors_theme_glyph_overrides():
     theme = cli.CardTheme(
-        glyphs={**cli._DEFAULT_GLYPHS, "running": "»", "check_failing": "X", "select_pointer": "="},
+        glyphs={**cli._DEFAULT_GLYPHS, "working": "»", "check_failing": "X", "select_pointer": "="},
         colors=cli._DEFAULT_COLORS,
     )
-    card = _git_card(running=True, pr={"number": 3, "state": "open", "checks": "failing"})
+    card = _git_card(
+        state=SessionState(WORKING),
+        pr={"number": 3, "state": "open", "checks": "failing"},
+    )
     text = "".join(t for _s, t in cli._render_cards([card], pointed_at=0, width=54, theme=theme))
     assert "» " in text and "X failing" in text and "= " in text  # all three overrides applied
     assert "▸ " not in text and "❯ " not in text                  # defaults replaced
@@ -1953,3 +1990,160 @@ def test_wrap_choice_lines_enables_wrapping_on_the_choices_window():
     assert bool(window.wrap_lines()) is False   # questionary's default
     cli._wrap_choice_lines(q)
     assert bool(window.wrap_lines()) is True     # flipped on
+
+
+# --- the live session board (`vv --watch`) -----------------------------------
+
+def _board_card(folder, session_state, **over):
+    repo, _, name = folder.partition("/")
+    card = {
+        "state": session_state, "title": None, "summary": "Doing a thing",
+        "labels": [], "branch": name, "dirty": False, "folder": folder,
+        "repo": repo, "name": name, "path": Path("/tmp") / name,
+        "pr": None, "pr_pending": False, "when": "2h ago",
+    }
+    card.update(over)
+    return card
+
+
+def _board(*lanes):
+    model = cli._BoardModel(default_agent="claude")
+    model.lanes = list(lanes)
+    return model
+
+
+def _widths(rows):
+    return {sum(len(text) for _style, text in row) for row in rows}
+
+
+def test_board_lays_out_columns_when_they_fit():
+    model = _board(
+        (NEEDS_YOU, [_board_card("r/a", SessionState(NEEDS_YOU))]),
+        (WORKING, [_board_card("r/b", SessionState(WORKING))]),
+    )
+    rows, _cursor = cli._board_rows(model.lanes, None, 200, cli._DEFAULT_THEME)
+    header = "".join(t for _s, t in rows[0])
+    assert "Needs you" in header and "Working" in header    # side by side on one row
+
+
+def test_board_stacks_lanes_when_too_narrow():
+    model = _board(
+        (NEEDS_YOU, [_board_card("r/a", SessionState(NEEDS_YOU))]),
+        (WORKING, [_board_card("r/b", SessionState(WORKING))]),
+    )
+    rows, _cursor = cli._board_rows(model.lanes, None, 60, cli._DEFAULT_THEME)
+    lines = ["".join(t for _s, t in row) for row in rows]
+    assert "Needs you" in lines[0] and "Working" not in lines[0]
+    assert any("Working" in line for line in lines[1:])     # further down instead
+
+
+def test_board_columns_keep_every_row_the_same_width():
+    """The alignment invariant: one over-long row would shear every column right of it."""
+    model = _board(
+        (NEEDS_YOU, [_board_card(
+            "some-repo/a-really-long-session-name",
+            SessionState(NEEDS_YOU, "a question that runs on and on and on and on"),
+            branch="feat/an-extremely-long-renamed-branch-from-the-pr-flow",
+            dirty=True,
+        )]),
+        (REVIEW, [_board_card("r/b", SessionState(REVIEW))]),
+        (IDLE, [_board_card("r/c", SessionState(IDLE))]),
+    )
+    for width in (200, 150, 120, 80, 40):
+        rows, _cursor = cli._board_rows(model.lanes, None, width, cli._DEFAULT_THEME)
+        assert len(_widths(rows)) == 1, f"ragged rows at width={width}"
+        assert _widths(rows).pop() <= width
+
+
+def test_board_always_shows_the_needs_you_lane():
+    """"Nothing is waiting on you" is the most useful thing the board can say."""
+    model = _board((NEEDS_YOU, []), (IDLE, [_board_card("r/c", SessionState(IDLE))]))
+    rows, _cursor = cli._board_rows(model.lanes, None, 200, cli._DEFAULT_THEME)
+    text = "".join(t for row in rows for _s, t in row)
+    assert "Needs you" in text and "nothing here" in text
+
+
+def test_board_marks_the_selected_card():
+    model = _board((NEEDS_YOU, [
+        _board_card("r/a", SessionState(NEEDS_YOU)),
+        _board_card("r/b", SessionState(NEEDS_YOU)),
+    ]))
+    rows, cursor = cli._board_rows(model.lanes, (0, 1), 80, cli._DEFAULT_THEME)
+    assert cursor is not None                              # scrolls the card into view
+    selected = ["".join(t for _s, t in row) for row in rows if row and "▌" in "".join(
+        t for _s, t in row)]
+    assert any("r/b" in line for line in selected)
+    assert not any("r/a" in line for line in selected)
+
+
+def test_board_with_no_sessions_renders_a_message():
+    rows, cursor = cli._board_rows([], None, 80, cli._DEFAULT_THEME)
+    assert cursor is None
+    assert "No sessions yet" in "".join(t for row in rows for _s, t in row)
+
+
+def test_board_model_navigation_helpers():
+    model = _board(
+        (NEEDS_YOU, [_board_card("r/a", SessionState(NEEDS_YOU))]),
+        (IDLE, [_board_card("r/b", SessionState(IDLE)), _board_card("r/c", SessionState(IDLE))]),
+    )
+    assert model.total == 3
+    assert model.flat() == [(0, 0), (1, 0), (1, 1)]
+    assert model.card((1, 1))["folder"] == "r/c"
+
+
+def test_fit_segments_truncates_an_overlong_row():
+    segments = [("class:a", "12345"), ("class:b", "67890")]
+    assert cli._fit_segments(segments, 20) == segments          # fits: untouched
+    assert cli._fit_segments(segments, 8) == [("class:a", "12345"), ("class:b", "67…")]
+    assert cli._fit_segments(segments, 5) == [("class:a", "12345")]
+    assert cli._fit_segments(segments, 0) == []
+
+
+def test_card_row_width_tracks_the_card_cap():
+    # On a wide terminal the header must stop where the cards stop.
+    assert cli._card_row_width(500) == cli._CARD_GUTTER + cli._CARD_MAX_WIDTH
+    assert cli._card_row_width(60) == cli._CARD_GUTTER + 56
+
+
+def test_board_model_reload_groups_and_never_summarizes(monkeypatch, tmp_path):
+    """A board on a timer must never spawn an agent — summaries come from cache only."""
+    monkeypatch.setattr(cli, "_list_worktrees", lambda: [("r", "a", tmp_path / "a")])
+    monkeypatch.setattr(cli, "_git_facts", lambda w: {("r", "a"): (False, "a")})
+    monkeypatch.setattr(cli.pr, "Snapshot", lambda paths: _StubSnapshot())
+    monkeypatch.setattr(cli.notes, "all_notes", lambda: {})
+    monkeypatch.setattr(
+        cli.state, "classify_all",
+        lambda sessions, **kw: {("r", "a"): SessionState(NEEDS_YOU, "well?")},
+    )
+    monkeypatch.setattr(
+        cli.summary, "load_cache", lambda: {"r/a": {"summary": "cached line"}}
+    )
+    monkeypatch.setattr(cli.summary, "summarize_all", _never_called)
+
+    model = cli._BoardModel(default_agent="claude")
+    model.reload()
+    assert [name for name, _cards in model.lanes] == [NEEDS_YOU]
+    card = model.card((0, 0))
+    assert card["summary"] == "cached line"
+    assert card["state"].detail == "well?"
+    assert model.refreshed_at > 0
+
+
+def _never_called(*args, **kwargs):
+    raise AssertionError("the board must not run a summary agent")
+
+
+def test_session_list_is_ordered_by_triage_state(sessions_menu, monkeypatch, tmp_path):
+    """The list is a queue, not a pile: whoever wants you most comes first."""
+    for name in ("idle-one", "needs-me", "working-one"):
+        _git_session(tmp_path, name)
+    order = {
+        ("repo", "idle-one"): SessionState(IDLE),
+        ("repo", "needs-me"): SessionState(NEEDS_YOU, "well?"),
+        ("repo", "working-one"): SessionState(WORKING),
+    }
+    monkeypatch.setattr(cli.state, "classify_all", lambda sessions, **kw: order)
+    menu = sessions_menu(["idle-one", "needs-me", "working-one"], [("cancel", None)])
+    cli._menu_list_sessions("claude", bypass=True)
+    assert [c["name"] for c in menu["cards"]] == ["needs-me", "working-one", "idle-one"]

@@ -337,6 +337,46 @@ def _transcript_path(path: Path) -> Path | None:
     return None
 
 
+#: Memo for :func:`last_turn`, one entry per transcript: ``{path: (mtime, turn)}``.
+#: The board re-classifies every session on a timer, but a transcript only
+#: changes when the agent writes to it — so this keeps a refresh free for every
+#: session that has not moved.
+_LAST_TURN_CACHE: dict[str, tuple[int, tuple[str, str] | None]] = {}
+
+
+def last_turn(path: Path) -> tuple[str, str] | None:
+    """The most recent real conversation turn in a session, as ``(role, text)``.
+
+    ``("assistant", …)`` means the agent spoke last and nothing has answered it:
+    the session is sitting at its prompt waiting on the user. ``("user", …)``
+    means the agent is still working through a request. :mod:`vv.state` turns
+    that into whose move it is.
+
+    "Real" is :func:`_clean_turn`'s definition — the same one the summaries use,
+    so tool calls, tool results and slash/bash-command turns don't count as the
+    agent having said something. Returns ``None`` when no store has a transcript
+    for this session. Best-effort throughout; never raises.
+    """
+    transcript = _transcript_path(path)
+    if transcript is None:
+        return None
+    mtime = _mtime_ns(transcript)
+    cached = _LAST_TURN_CACHE.get(str(transcript))
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+    turn: tuple[str, str] | None = None
+    for provider in (_claude_messages, _gemini_messages, _codex_messages):
+        try:
+            messages = provider(path)
+        except OSError:
+            messages = []
+        if messages:
+            turn = messages[-1]
+            break
+    _LAST_TURN_CACHE[str(transcript)] = (mtime, turn)
+    return turn
+
+
 def _render_messages(messages: list[tuple[str, str]]) -> str:
     """Render the first + last-few messages into a bounded transcript snippet."""
     if not messages:

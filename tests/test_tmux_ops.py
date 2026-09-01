@@ -195,3 +195,67 @@ def test_run_raises_tmux_error_on_command_failure(monkeypatch):
     monkeypatch.setattr(subprocess, "run", boom)
     with pytest.raises(tmux_ops.TmuxError, match="boom"):
         tmux_ops._run(["kill-server"])
+
+
+# --- session_activity -------------------------------------------------------
+
+def _panes(*rows: str) -> str:
+    return "".join(row + "\n" for row in rows)
+
+
+def test_session_activity_empty_when_no_server(monkeypatch):
+    _stub_run(monkeypatch, _completed(returncode=1))
+    assert tmux_ops.session_activity() == {}
+
+
+def test_session_activity_parses_the_active_pane(monkeypatch):
+    calls = _stub_run(monkeypatch, _completed(stdout=_panes(
+        "brave-falcon\t1700000000\t1\t1\tclaude\t0\t1",
+    )))
+    activity = tmux_ops.session_activity()
+    assert list(calls[0][:2]) == ["list-panes", "-a"]       # one call, whole server
+    entry = activity["brave-falcon"]
+    assert entry.last_activity == 1700000000.0
+    assert entry.attached is True
+    assert entry.command == "claude"
+    assert entry.at_shell is False
+
+
+def test_session_activity_keeps_only_the_active_pane(monkeypatch):
+    # A split window reports several panes; only the one the agent runs in counts.
+    _stub_run(monkeypatch, _completed(stdout=_panes(
+        "sess\t1700000000\t0\t0\tvim\t0\t1",
+        "sess\t1700000000\t0\t1\tclaude\t0\t1",
+    )))
+    assert tmux_ops.session_activity()["sess"].command == "claude"
+
+
+def test_session_activity_flags_a_pane_back_at_a_shell(monkeypatch):
+    _stub_run(monkeypatch, _completed(stdout=_panes(
+        "gone\t1700000000\t0\t1\tzsh\t0\t1",
+        "dead\t1700000000\t0\t1\tclaude\t1\t1",
+    )))
+    activity = tmux_ops.session_activity()
+    assert activity["gone"].at_shell is True        # agent exited back to the shell
+    assert activity["dead"].at_shell is True        # pane's process is gone
+
+
+def test_session_activity_vv_only_filters_on_the_tag(monkeypatch):
+    stdout = _panes(
+        "mine\t1700000000\t0\t1\tclaude\t0\t1",
+        "theirs\t1700000000\t0\t1\tbash\t0\t",
+    )
+    _stub_run(monkeypatch, _completed(stdout=stdout))
+    assert set(tmux_ops.session_activity()) == {"mine", "theirs"}
+    _stub_run(monkeypatch, _completed(stdout=stdout))
+    assert set(tmux_ops.session_activity(vv_only=True)) == {"mine"}
+
+
+def test_session_activity_skips_malformed_and_unparseable_rows(monkeypatch):
+    _stub_run(monkeypatch, _completed(stdout=_panes(
+        "short\trow",                                   # too few fields
+        "ok\tnotanumber\t0\t1\tclaude\t0\t1",           # activity we can't parse
+    )))
+    activity = tmux_ops.session_activity()
+    assert "short" not in activity
+    assert activity["ok"].last_activity == 0.0          # degrades, does not raise
