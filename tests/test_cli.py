@@ -1953,3 +1953,187 @@ def test_wrap_choice_lines_enables_wrapping_on_the_choices_window():
     assert bool(window.wrap_lines()) is False   # questionary's default
     cli._wrap_choice_lines(q)
     assert bool(window.wrap_lines()) is True     # flipped on
+
+
+# --- repos are labelled <org>/<repo> -----------------------------------------
+
+@pytest.fixture
+def owner_lookup(monkeypatch):
+    """Stub the origin-remote lookup behind `_repo_label` with a fresh cache."""
+    monkeypatch.setattr(cli, "_repo_urls", {})
+
+    def configure(urls: dict):
+        def fake_remote_url(workspace, remote="origin"):
+            try:
+                return urls[workspace.name]
+            except KeyError:
+                raise cli.git_ops.GitError("no origin")
+
+        monkeypatch.setattr(cli.git_ops, "remote_url", fake_remote_url)
+
+    return configure
+
+
+def test_repo_label_prefixes_the_owning_org(owner_lookup):
+    owner_lookup({"vv": "git@github.com:acme/vv.git"})
+    assert cli._repo_label("vv") == "acme/vv"
+
+
+def test_repo_label_falls_back_to_the_bare_name(owner_lookup):
+    owner_lookup({})  # every lookup raises: no origin, or an unreadable clone
+    assert cli._repo_label("vv") == "vv"
+
+
+def test_repo_label_leaves_the_chats_sentinel_alone(owner_lookup):
+    owner_lookup({})
+    assert cli._repo_label(cli.CHATS) == cli.CHATS
+
+
+def test_repo_label_is_cached_per_repo(owner_lookup, monkeypatch):
+    owner_lookup({"vv": "git@github.com:acme/vv.git"})
+    calls = []
+    real = cli.git_ops.remote_url
+    monkeypatch.setattr(
+        cli.git_ops, "remote_url", lambda w, *a, **k: (calls.append(w.name), real(w))[1]
+    )
+    assert cli._repo_label("vv") == cli._repo_label("vv") == "acme/vv"
+    assert calls == ["vv"]
+
+
+def test_pick_repo_lists_org_and_repo_but_returns_the_directory(owner_lookup, monkeypatch):
+    owner_lookup({
+        "vv": "git@github.com:acme/vv.git",
+        "tools": "https://github.com/zzz-corp/tools.git",
+        "loose": "/somewhere/loose",  # no owner — listed bare
+    })
+    seen = {}
+
+    def fake_pick(message, choices):
+        seen["titles"] = [c.title for c in choices]
+        return "select", choices[0].value
+
+    monkeypatch.setattr(cli, "_pick_with_delete", fake_pick)
+    action, repo = cli._pick_repo("which?", ["tools", "vv", "loose"])
+    # sorted by the *label*, so an org's repos sit together in the list
+    assert seen["titles"] == ["acme/vv", "loose", "zzz-corp/tools"]
+    assert (action, repo) == ("select", "vv")
+
+
+def test_session_cards_and_filter_titles_carry_the_org(owner_lookup, monkeypatch, tmp_path):
+    owner_lookup({"repo": "git@github.com:acme/repo.git"})
+    monkeypatch.setenv("WORKSPACES_DIR", str(tmp_path / "ws"))
+    monkeypatch.setenv("WORKTREES_DIR", str(tmp_path / "wt"))
+    path = tmp_path / "wt" / "repo" / "breezy"
+    path.mkdir(parents=True)
+
+    monkeypatch.setattr(cli, "_list_worktrees", lambda: [("repo", "breezy", path)])
+    monkeypatch.setattr(cli.tmux_ops, "list_sessions", lambda *a, **k: [])
+    monkeypatch.setattr(cli, "_session_summaries", lambda *a, **k: {})
+    monkeypatch.setattr(cli, "_session_branch", lambda p: "feat/cards")
+    monkeypatch.setattr(cli, "_worktree_dirty", lambda p: False)
+    monkeypatch.setattr(cli.pr, "Snapshot", lambda paths: _StubSnapshot())
+
+    captured = {}
+
+    def fake_pick(message, choices, cards, *args, **kwargs):
+        captured["titles"] = [c.title for c in choices]
+        captured["folders"] = [c["folder"] for c in cards]
+        return "cancel", None
+
+    monkeypatch.setattr(cli, "_pick_session", fake_pick)
+    cli._menu_list_sessions("claude", True)
+
+    assert captured["folders"] == ["acme/repo/breezy"]
+    assert captured["titles"] == ["acme/repo/breezy"]  # what '/' filters on
+
+
+# --- same-named repos from different orgs ------------------------------------
+
+@pytest.fixture
+def workspaces(tmp_path, monkeypatch):
+    """An empty workspaces dir, with a fresh origin-URL cache."""
+    root = tmp_path / "ws"
+    root.mkdir()
+    monkeypatch.setenv("WORKSPACES_DIR", str(root))
+    monkeypatch.setattr(cli, "_repo_urls", {})
+    return root
+
+
+def _clone_dir(root, name, url):
+    """Pretend ``name`` was cloned from ``url`` (the picker only reads origin)."""
+    (root / name).mkdir()
+    cli._repo_urls[name] = url
+
+
+def test_workspace_for_url_uses_the_bare_name_when_free(workspaces):
+    name, path = cli._workspace_for_url("git@github.com:openrewrite/rewrite-prethink.git")
+    assert name == "rewrite-prethink"
+    assert path == workspaces / "rewrite-prethink"
+
+
+def test_workspace_for_url_reuses_the_clone_of_the_same_remote(workspaces):
+    _clone_dir(workspaces, "rewrite-prethink", "git@github.com:openrewrite/rewrite-prethink.git")
+
+    # The HTTPS form of the same repo must resolve to the existing clone.
+    name, path = cli._workspace_for_url("https://github.com/openrewrite/rewrite-prethink")
+    assert name == "rewrite-prethink"
+    assert path == workspaces / "rewrite-prethink"
+
+
+def test_workspace_for_url_qualifies_a_same_name_repo_from_another_org(workspaces):
+    _clone_dir(workspaces, "rewrite-prethink", "git@github.com:openrewrite/rewrite-prethink.git")
+
+    name, path = cli._workspace_for_url("git@github.com:moderneinc/rewrite-prethink.git")
+    assert name == "moderneinc-rewrite-prethink"
+    assert path == workspaces / "moderneinc-rewrite-prethink"
+
+
+def test_workspace_for_url_reuses_an_org_qualified_clone(workspaces):
+    _clone_dir(workspaces, "rewrite-prethink", "git@github.com:openrewrite/rewrite-prethink.git")
+    _clone_dir(
+        workspaces,
+        "moderneinc-rewrite-prethink",
+        "git@github.com:moderneinc/rewrite-prethink.git",
+    )
+
+    name, _path = cli._workspace_for_url("https://github.com/moderneinc/rewrite-prethink.git")
+    assert name == "moderneinc-rewrite-prethink"
+
+
+def test_workspace_for_url_flattens_a_nested_group(workspaces):
+    _clone_dir(workspaces, "tools", "https://gitlab.com/other/tools.git")
+
+    name, _path = cli._workspace_for_url("https://gitlab.com/group/subgroup/tools.git")
+    assert name == "group-subgroup-tools"
+
+
+def test_workspace_for_url_numbers_past_a_taken_qualified_name(workspaces):
+    # An unrelated directory already squats both candidate names.
+    (workspaces / "tools").mkdir()
+    (workspaces / "acme-tools").mkdir()
+
+    name, _path = cli._workspace_for_url("git@github.com:acme/tools.git")
+    assert name == "acme-tools-2"
+
+
+def test_start_from_url_clones_a_same_name_repo_into_its_own_dir(
+    workspaces, monkeypatch, tmp_path
+):
+    """The reported bug: a second org's repo must not reuse the first's clone."""
+    _clone_dir(workspaces, "rewrite-prethink", "git@github.com:openrewrite/rewrite-prethink.git")
+    cloned: dict = {}
+    monkeypatch.setattr(
+        cli.git_ops, "clone", lambda url, dest: (cloned.update(url=url, dest=dest), dest.mkdir())
+    )
+    monkeypatch.setattr(cli.git_ops, "has_head_commit", lambda workspace: True)
+    started: dict = {}
+    monkeypatch.setattr(
+        cli,
+        "_new_worktree_session",
+        lambda repo, workspace, *a, **k: started.update(repo=repo, workspace=workspace),
+    )
+
+    cli._start_from_url("git@github.com:moderneinc/rewrite-prethink.git", "claude", True)
+
+    assert cloned["dest"] == workspaces / "moderneinc-rewrite-prethink"
+    assert started["repo"] == "moderneinc-rewrite-prethink"

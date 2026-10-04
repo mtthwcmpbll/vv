@@ -132,8 +132,10 @@ attaches. `_list_worktrees()` enumerates worktrees across all cloned repos (via
 `(_chats, name, path)` tuples; the sentinel string is `cli.CHATS = "_chats"`.
 
 The "start a new session from an existing repo" menu (`_menu_new_from_repo()`)
-lists cloned repos via `_pick_repo()`, which also binds **`x`** on the
-highlighted repo to delete it wholesale (→ `_delete_repo()`): it confirms,
+lists cloned repos via `_pick_repo()` — as **`<org>/<repo>`** (see "Repos are
+labelled with their org" below), sorted by that label so an org's repos sit
+together, though the value handed back is still the clone's directory name. It
+also binds **`x`** on the highlighted repo to delete it wholesale (→ `_delete_repo()`): it confirms,
 listing any worktrees that would be lost (flagged when running / dirty /
 unpushed), then kills their live tmux sessions and `shutil.rmtree`s both the
 per-repo worktrees dir and the workspace clone. (`_pick_repo()` reaches into
@@ -143,7 +145,7 @@ public hook — and returns a `("select" | "delete" | "cancel", repo)` tuple.)
 The "list existing sessions" menu (`_menu_list_sessions()`) offers each chosen
 worktree a **resume** (→ `_resume_session()`) or **delete** (→
 `_delete_session()`) action, plus a **sweep** of all the stale ones at once
-(→ `_sweep_stale_sessions()`, see below) and a **`/` filter** over `repo/name`
+(→ `_sweep_stale_sessions()`, see below) and a **`/` filter** over `org/repo/name`
 (see "Filtering a list with `/`" below). It is a **loop**: a delete or sweep
 rebuilds and redraws the list instead of leaving the menu, so a run of stale
 sessions can be cleaned up in one visit (resume and cancel still leave; an
@@ -174,7 +176,7 @@ and in the quieter `card.summary` style, so a card can carry both. Then — when
 the session has any — a row of `#label` chips indented the same way (both from
 `notes.all_notes()`; chips are joined by the `label_gap` glyph and wrapped like
 the headline, and each row is omitted entirely when empty), then a
-`branch [*] · repo/name` line (the branch from `_session_branch()`, *asked of
+`branch [*] · org/repo/name` line (the branch from `_session_branch()`, *asked of
 git* rather than assumed to be the session name — see "The branch is not the
 session name" below; the `*`, from `_worktree_dirty()`,
 flags uncommitted/unpushed work; no leading glyph — an uncommon symbol like `⎇`
@@ -239,6 +241,46 @@ still warned if the directory is non-empty) and `_remove_session()` `rmtree`s
 them. Every deletion path (plus `_delete_repo()`, via `notes.forget_repo()`)
 clears the session's notes so they don't linger in the store.
 
+#### Repos are labelled with their org (`_repo_label()`)
+
+Repos clone into `WORKSPACES_DIR/<name>` under their **bare** name, so two repos
+called `tools` from different orgs are indistinguishable in the menus. Anything
+that *shows* a repo therefore runs it through `cli._repo_label()`, which returns
+`<org>/<repo>` — the org read off the clone's `origin` URL
+(`git_ops.remote_url()` + `git_ops.owner_from_url()`, which also handles GitLab's
+nested `group/subgroup`). It is display-only and best-effort: a repo with no
+origin (or an unreadable clone, or a local-path remote) is shown bare, and the
+`CHATS` sentinel passes through untouched. Origin URLs are cached in `_repo_urls`
+for the life of the process — one `git remote get-url` per repo — and dropped
+when `_delete_repo()` removes the clone, since a re-clone may come from a
+different org.
+
+The **identity** of a repo is still its directory name: the notes/summary/PR
+cache keys, `_list_worktrees()`, and every picker's *value* are unchanged, so
+adding the org relabels the UI without migrating any state.
+
+#### Same-named repos from different orgs (`_workspace_for_url()`)
+
+The bare clone directory is also what *collides*: adding
+`moderneinc/rewrite-prethink` next to `openrewrite/rewrite-prethink` would
+otherwise land in the same `WORKSPACES_DIR/rewrite-prethink` and quietly cut its
+sessions from the wrong repo. So `_start_from_url()` resolves the clone
+directory through `cli._workspace_for_url()` rather than
+`repo_name_from_url()` alone:
+
+1. If any existing clone's `origin` is **the same remote**
+   (`git_ops.same_remote()` — scheme-, credential- and case-insensitive, so the
+   SSH and HTTPS forms of one repo match), reuse it whatever it is called.
+2. Otherwise take the bare name if that directory is free, else an
+   **org-qualified** `<org>-<name>` (a nested GitLab group flattened to one path
+   segment), numbering `-2`, `-3`… in the impossible case that is taken too.
+
+Existing clones keep their bare directory name — the name is the repo's identity
+everywhere else — so nothing migrates; only the *new* same-named repo gets the
+prefix, and `_repo_label()` still shows both as `<org>/<repo>`. For the same
+reason `_start_from_url()`'s own "Cloning…" / "already cloned" lines report that
+label, not the (possibly prefixed) directory.
+
 #### Filtering a list with `/` (`_enable_filter()`)
 
 Every list long enough to hunt through — the session cards, the cloned-repo
@@ -248,8 +290,8 @@ backspace rubs it out, and **Esc** leaves and clears it. Arrow keys and Enter
 keep working while typing, so a filter can be typed and its result resumed
 without leaving the mode. Matching is questionary's own (`control.search_filter`
 + `filtered_choices`, a case-insensitive substring of the choice *title*), which
-for sessions is `repo/name` — the worktree name and its repo, not the summary,
-labels or branch on the card. A filter matching nothing falls back to showing
+for sessions is `org/repo/name` — the worktree name and its org-qualified
+repo, not the summary, labels or branch on the card. A filter matching nothing falls back to showing
 everything (questionary's behavior), and the `/ text…` footer under the list is
 likewise questionary's, drawn for any select whose `search_filter` is set — vv
 only ever sets it.
@@ -310,8 +352,8 @@ session the PR cache doesn't know (the cards' background refresh may not have
 landed, and treating an unknown PR as "not merged" would silently under-clean) —
 the one place in vv where waiting on `gh` is the right trade, and it prints
 "Checking N session(s)…" while it does; (2) removals are individually wrapped, so
-one locked worktree reports `! kept repo/name: …` and the rest of the batch still
-goes through — the closing tally is "Deleted N of M".
+one locked worktree reports `! kept org/repo/name: …` and the rest of the batch
+still goes through — the closing tally is "Deleted N of M".
 
 ### Session notes (title + labels)
 
@@ -523,7 +565,10 @@ is verified; the others in `BYPASS_FLAGS` are best-guesses.
   needed); (2) `_claude_file()` skips transcripts that are vv's *own* summary
   runs (`_is_summary_run()`, detected by the `_SUMMARY_MARKER` opening of
   `_PROMPT`), so a summary never feeds on a previous summary.
-- `git_ops.py` — `git` CLI wrappers; raises `GitError`.
+- `git_ops.py` — `git` CLI wrappers; raises `GitError`. Also the pure URL
+  parsers `repo_name_from_url()`, `owner_from_url()` (→ the org behind a
+  clone, `None` when the URL has none) and `same_remote()` (→ do two clone URLs
+  name the same repo, ignoring protocol/credentials/`.git`/case).
 - `gh_ops.py` — optional `gh` (GitHub CLI) wrappers powering the "Add a new
   repo" picker and the "Create a new GitHub project" flow: `is_available()` (on
   PATH **and** authenticated), `list_repos_detailed()` (every

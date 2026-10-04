@@ -253,3 +253,67 @@ def remove_worktree(workspace: Path, worktree_path: Path, *, force: bool = False
 def delete_branch(workspace: Path, branch: str, *, force: bool = False) -> None:
     """Delete a local branch. With ``force``, delete even if unmerged."""
     _run(["git", "-C", str(workspace), "branch", "-D" if force else "-d", branch])
+
+
+def remote_url(workspace: Path, remote: str = "origin") -> str:
+    """Return the configured URL of ``remote`` for the workspace clone."""
+    return _run(
+        ["git", "-C", str(workspace), "remote", "get-url", remote],
+        capture=True,
+    )
+
+
+def owner_from_url(url: str) -> str | None:
+    """Derive the owning org/user from a clone URL, or None if there isn't one.
+
+    Handles ``https://host/owner/name.git``, ``git@host:owner/name.git`` and
+    nested groups (GitLab's ``group/subgroup/name`` → ``group/subgroup``). A
+    local path clone (no owner segment) returns ``None``.
+    """
+    path = url.rstrip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    if "://" in path:
+        path = path.split("://", 1)[1]
+        if "/" not in path:
+            return None
+        path = path.split("/", 1)[1]  # strip host[:port]
+    elif ":" in path and not path.startswith("/"):
+        # scp-style git@host:owner/name — everything after the first colon.
+        path = path.split(":", 1)[1]
+    else:
+        return None  # plain filesystem path: no owner to report
+    if "/" not in path:
+        return None  # just a repo name, no owning org/user
+    owner = path.rsplit("/", 1)[0].strip("/")
+    return owner or None
+
+
+def _normalized_remote(url: str) -> str:
+    """Return a comparable ``host/owner/name`` form of a clone URL.
+
+    Strips the scheme, any ``user@`` credentials, a trailing ``.git`` and case,
+    so ``git@github.com:acme/tools.git`` and
+    ``https://github.com/ACME/tools`` compare equal. A local path is returned
+    as-is (minus ``.git``), which is all the comparison needs from it.
+    """
+    path = url.strip().rstrip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    if "://" in path:
+        path = path.split("://", 1)[1]
+        path = path.split("@", 1)[-1]  # strip user[:password]@
+    elif ":" in path and not path.startswith("/"):
+        # scp-style git@host:owner/name — rewrite to host/owner/name.
+        host, _, rest = path.partition(":")
+        path = f"{host.split('@', 1)[-1]}/{rest.strip('/')}"
+    return path.lower()
+
+
+def same_remote(a: str, b: str) -> bool:
+    """Return whether two clone URLs point at the same repository.
+
+    Protocol-agnostic (SSH and HTTPS forms of one repo match) so an already
+    cloned repo is recognised however it was originally added.
+    """
+    return _normalized_remote(a) == _normalized_remote(b)

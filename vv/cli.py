@@ -59,6 +59,46 @@ def _list_repos() -> list[str]:
     return sorted(p.name for p in root.iterdir() if p.is_dir())
 
 
+# Cache of repo dir name -> origin URL (or None when unreadable). Filled
+# lazily: each entry costs a `git remote get-url`, and a clone's origin does
+# not change under us within one run of the menu.
+_repo_urls: dict[str, str | None] = {}
+
+
+def _repo_url(repo: str) -> str | None:
+    """Return a cloned repo's origin URL, or None if it has none/is unreadable."""
+    if repo not in _repo_urls:
+        try:
+            url = git_ops.remote_url(config.workspaces_dir() / repo)
+        except git_ops.GitError:
+            url = None
+        _repo_urls[repo] = url or None
+    return _repo_urls[repo]
+
+
+def _repo_owner(repo: str) -> str | None:
+    """Return the org/user a cloned repo belongs to, from its origin remote.
+
+    Best-effort and cached: a repo with no origin, an unreadable clone, or a
+    local-path remote just has no owner to show.
+    """
+    url = _repo_url(repo)
+    return git_ops.owner_from_url(url) if url else None
+
+
+def _repo_label(repo: str) -> str:
+    """Return ``<org>/<repo>`` for display, or just ``<repo>`` if unknown.
+
+    Repos are cloned into the workspaces dir under their bare name, so two
+    repos of the same name from different orgs are otherwise indistinguishable
+    in the menus. The chat sentinel has no remote and is shown as-is.
+    """
+    if repo == CHATS:
+        return repo
+    owner = _repo_owner(repo)
+    return f"{owner}/{repo}" if owner else repo
+
+
 def _created_ts(path: Path) -> float:
     """Return the session's creation time as a Unix timestamp.
 
@@ -281,6 +321,42 @@ def _new_chat_session(
     _resume_worktree(name, chat_path, agent, bypass)
 
 
+def _workspace_for_url(repo_url: str) -> tuple[str, Path]:
+    """Return the ``(dir name, path)`` to clone ``repo_url`` into.
+
+    Repos clone under their bare name, so ``acme/tools`` and ``other/tools``
+    would otherwise land in the same directory and share each other's
+    worktrees. An existing clone is only reused when its origin is *the same
+    remote* (protocol-agnostic, via :func:`git_ops.same_remote`); a same-named
+    repo from a different org gets an org-qualified directory
+    (``other-tools``) instead, numbered if even that is taken.
+
+    Existing clones keep their bare directory name — the name is a repo's
+    identity throughout vv (notes/summary/PR cache keys), so nothing migrates.
+    """
+    root = config.workspaces_dir()
+    name = git_ops.repo_name_from_url(repo_url)
+
+    # Reuse an existing clone of this exact remote, whatever it is called.
+    if root.is_dir():
+        for existing in _list_repos():
+            url = _repo_url(existing)
+            if url and git_ops.same_remote(url, repo_url):
+                return existing, root / existing
+
+    owner = git_ops.owner_from_url(repo_url)
+    candidates = [name]
+    if owner:
+        # Flatten a nested GitLab group so the result stays one path segment.
+        qualified = f"{owner.replace('/', '-')}-{name}"
+        candidates.append(qualified)
+        candidates += [f"{qualified}-{n}" for n in range(2, 100)]
+    for candidate in candidates:
+        if not (root / candidate).exists():
+            return candidate, root / candidate
+    raise _fail(f"could not find a free directory name for '{name}'")
+
+
 def _start_from_url(
     repo_url: str,
     agent: str,
@@ -289,14 +365,17 @@ def _start_from_url(
     pending_notes: "notes.Pending | None" = None,
 ) -> None:
     """Clone the repo if needed, then create a new worktree session."""
-    repo_name = git_ops.repo_name_from_url(repo_url)
-    workspace = config.workspaces_dir() / repo_name
+    repo_name, workspace = _workspace_for_url(repo_url)
+    # Announce the repo the way the menus do (<org>/<repo>), not by the clone
+    # directory name, which may carry a disambiguating org prefix.
+    owner = git_ops.owner_from_url(repo_url)
+    label = f"{owner}/{git_ops.repo_name_from_url(repo_url)}" if owner else repo_name
 
     if workspace.exists():
         # No fetch here — _new_worktree_session fetches for every create flow.
-        typer.secho(f"Repo '{repo_name}' already cloned.", fg=typer.colors.CYAN)
+        typer.secho(f"Repo '{label}' already cloned.", fg=typer.colors.CYAN)
     else:
-        typer.secho(f"Cloning '{repo_name}'...", fg=typer.colors.CYAN)
+        typer.secho(f"Cloning '{label}'...", fg=typer.colors.CYAN)
         git_ops.clone(repo_url, workspace)
 
     # A freshly-created remote has no commits, so its HEAD is unborn and there
@@ -444,7 +523,7 @@ def _delete_session(repo: str, name: str, path: Path, live: set[str]) -> bool:
 
     risks = _work_at_risk(path)
     if risks:
-        typer.secho(f"'{repo}/{name}' has work that would be lost:", fg=typer.colors.YELLOW)
+        typer.secho(f"'{_repo_label(repo)}/{name}' has work that would be lost:", fg=typer.colors.YELLOW)
         for risk in risks:
             typer.secho(f"  - {risk}", fg=typer.colors.YELLOW)
         confirmed = questionary.confirm(
@@ -455,7 +534,7 @@ def _delete_session(repo: str, name: str, path: Path, live: set[str]) -> bool:
             return False
 
     _remove_session(repo, name, path, live)
-    typer.secho(f"Deleted worktree '{repo}/{name}'.", fg=typer.colors.GREEN)
+    typer.secho(f"Deleted worktree '{_repo_label(repo)}/{name}'.", fg=typer.colors.GREEN)
     return True
 
 
@@ -546,7 +625,9 @@ def _apply_notes(pending: notes.Pending, name: str | None) -> None:
         shown = ", ".join(current) if current else "(none)"
         typer.secho(f"  labels: {shown}", fg=typer.colors.CYAN)
 
-    typer.secho(f"Session '{repo}/{session_name}' updated.", fg=typer.colors.CYAN)
+    typer.secho(
+        f"Session '{_repo_label(repo)}/{session_name}' updated.", fg=typer.colors.CYAN
+    )
 
 
 def _session_summaries(
@@ -658,14 +739,21 @@ def _menu_list_sessions(default_agent: str, bypass: bool) -> None:
                 # branch is the readable one, and is what reviewers will see.
                 "branch": (_session_branch(path) or name) if is_git else None,
                 "dirty": _worktree_dirty(path) if is_git else False,
-                "folder": f"{repo}/{name}",
+                # <org>/<repo>/<name>, so same-named repos from different
+                # orgs are told apart at a glance.
+                "folder": f"{_repo_label(repo)}/{name}",
                 "pr": pr_cached.get(key),
                 "pr_pending": key in pr_stale,  # awaiting a background refresh
                 "when": _relative_time(_created_ts(path)),
             }
             cards.append(card)
             card_by_key[key] = card
-            choices.append(questionary.Choice(title=f"{repo}/{name}", value=(repo, name, path)))
+            # The title is what `/` filters on, so it carries the org too.
+            choices.append(
+                questionary.Choice(
+                    title=f"{_repo_label(repo)}/{name}", value=(repo, name, path)
+                )
+            )
 
         action, value = _pick_session(
             "Sessions  ·  enter to resume · x to delete · X to clean up stale · / to filter",
@@ -851,7 +939,12 @@ def _sweep_stale_sessions(
         bold=True,
     )
     for stale in candidates:
-        typer.secho(f"  {stale.repo}/{stale.name}", fg=typer.colors.WHITE, bold=True, nl=False)
+        typer.secho(
+            f"  {_repo_label(stale.repo)}/{stale.name}",
+            fg=typer.colors.WHITE,
+            bold=True,
+            nl=False,
+        )
         typer.secho(f"  ·  {stale.reason}", fg=typer.colors.GREEN, nl=False)
         typer.secho(
             f"  ·  {', '.join(stale.risks)}" if stale.risks else "",
@@ -875,7 +968,9 @@ def _sweep_stale_sessions(
             _remove_session(stale.repo, stale.name, stale.path, live)
         except (git_ops.GitError, tmux_ops.TmuxError, OSError) as exc:
             # One stubborn session mustn't strand the rest of the batch.
-            typer.secho(f"  ! kept {stale.repo}/{stale.name}: {exc}", fg=typer.colors.RED)
+            typer.secho(
+                f"  ! kept {_repo_label(stale.repo)}/{stale.name}: {exc}", fg=typer.colors.RED
+            )
             continue
         deleted += 1
     typer.secho(
@@ -1593,9 +1688,15 @@ def _pick_repo(message: str, repos: list[str]) -> tuple[str, str | None]:
 
     Returns ``(action, repo)`` where ``action`` is ``"select"`` (start a session
     from ``repo``), ``"delete"`` (remove ``repo`` from the workspaces dir), or
-    ``"cancel"`` (``repo`` is ``None``) when the user backed out.
+    ``"cancel"`` (``repo`` is ``None``) when the user backed out. Repos are
+    *listed* as ``<org>/<repo>`` (and sorted that way, so an org's repos sit
+    together) but the value is still the clone's directory name.
     """
-    return _pick_with_delete(message, repos)
+    choices = [
+        questionary.Choice(title=label, value=repo)
+        for label, repo in sorted((_repo_label(r), r) for r in repos)
+    ]
+    return _pick_with_delete(message, choices)
 
 
 def _delete_repo(repo: str) -> None:
@@ -1605,13 +1706,14 @@ def _delete_repo(repo: str) -> None:
     (flagged when running or holding unsaved work) so the loss is explicit.
     """
     workspace = config.workspaces_dir() / repo
+    label = _repo_label(repo)
     worktrees = [(name, path) for r, name, path in _list_worktrees() if r == repo]
     live = set(tmux_ops.list_sessions())
 
     if worktrees:
         plural = "" if len(worktrees) == 1 else "s"
         typer.secho(
-            f"'{repo}' has {len(worktrees)} worktree{plural} that will also be deleted:",
+            f"'{label}' has {len(worktrees)} worktree{plural} that will also be deleted:",
             fg=typer.colors.YELLOW,
         )
         for name, path in worktrees:
@@ -1630,9 +1732,9 @@ def _delete_repo(repo: str) -> None:
             typer.secho(f"  - {name}{suffix}", fg=typer.colors.YELLOW)
 
     confirmed = questionary.confirm(
-        f"Delete repo '{repo}' and all of its worktrees? This cannot be undone."
+        f"Delete repo '{label}' and all of its worktrees? This cannot be undone."
         if worktrees
-        else f"Delete repo '{repo}'? This cannot be undone.",
+        else f"Delete repo '{label}'? This cannot be undone.",
         default=False,
     ).ask()
     if not confirmed:
@@ -1651,7 +1753,8 @@ def _delete_repo(repo: str) -> None:
         shutil.rmtree(worktrees_root)
     shutil.rmtree(workspace)
     notes.forget_repo(repo)
-    typer.secho(f"Deleted repo '{repo}'.", fg=typer.colors.GREEN)
+    _repo_urls.pop(repo, None)  # a re-clone may come from a different org
+    typer.secho(f"Deleted repo '{label}'.", fg=typer.colors.GREEN)
 
 
 def _menu_new_from_repo(default_agent: str, bypass: bool) -> None:

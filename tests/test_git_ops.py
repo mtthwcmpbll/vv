@@ -37,6 +37,25 @@ def test_repo_name_from_url_rejects_nameless_urls(bad):
         git_ops.repo_name_from_url(bad)
 
 
+# --- owner_from_url (pure) ---------------------------------------------------
+
+@pytest.mark.parametrize(
+    "url, expected",
+    [
+        ("https://github.com/acme/repo.git", "acme"),
+        ("https://github.com/acme/repo", "acme"),
+        ("git@github.com:acme/repo.git", "acme"),
+        ("git@github.com:acme/repo.git/", "acme"),
+        ("ssh://git@host:22/acme/repo.git", "acme"),
+        ("https://gitlab.com/group/subgroup/repo.git", "group/subgroup"),
+        ("/local/path/to/myrepo", None),          # no owner in a filesystem path
+        ("https://github.com/repo", None),        # host-only path
+    ],
+)
+def test_owner_from_url(url, expected):
+    assert git_ops.owner_from_url(url) == expected
+
+
 # --- _run error handling ----------------------------------------------------
 
 def test_run_raises_git_error_when_git_is_missing(monkeypatch):
@@ -260,3 +279,30 @@ def test_delete_branch_needs_force_when_unmerged(worktree, git):
         git_ops.delete_branch(clone, "falcon")
     git_ops.delete_branch(clone, "falcon", force=True)
     assert "falcon" not in git_ops.existing_branches(clone)
+
+
+# --- same_remote --------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "a, b",
+    [
+        ("git@github.com:acme/tools.git", "https://github.com/acme/tools"),
+        ("https://github.com/ACME/Tools.git", "git@github.com:acme/tools"),
+        ("https://user@github.com/acme/tools", "https://github.com/acme/tools"),
+        ("https://github.com/acme/tools/", "https://github.com/acme/tools.git"),
+    ],
+)
+def test_same_remote_matches_equivalent_urls(a, b):
+    assert git_ops.same_remote(a, b)
+
+
+@pytest.mark.parametrize(
+    "a, b",
+    [
+        ("git@github.com:acme/tools.git", "git@github.com:other/tools.git"),
+        ("https://github.com/acme/tools", "https://gitlab.com/acme/tools"),
+        ("https://github.com/acme/tools", "https://github.com/acme/tools-ui"),
+    ],
+)
+def test_same_remote_rejects_different_repos(a, b):
+    assert not git_ops.same_remote(a, b)
