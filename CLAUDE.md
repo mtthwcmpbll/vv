@@ -60,7 +60,10 @@ Four flows, all ending in `_resume_worktree()`:
 - **`vv`** (no args) → `cli._interactive_menu()`: a `questionary` menu to
   list existing sessions, start a worktree from an already-cloned repo, add a
   repo (pick from your GitHub repos via `gh`, or paste a URL), create a brand-new
-  GitHub project, or start a chat-only session.
+  GitHub project, or start a chat-only session. **`r`** on this menu
+  (→ `_refresh_github_repos()`) refetches the GitHub repo/owner lists and redraws
+  the menu, for when a repo created within the last hour is missing from gh's
+  cache (see `gh_ops.refresh_cache()` below).
 
 A fifth flow starts no session at all: **`vv --title TEXT`** (`-t`) /
 **`vv --label TAG`** (`-l`) → `cli._apply_notes()` annotates an *existing*
@@ -575,7 +578,11 @@ is verified; the others in `BYPASS_FLAGS` are best-guesses.
   `(owner/name, is_template)` the user can access via the `user/repos` API,
   paginated and `gh`-cached for an hour — spans org repos, not just the user's
   own) with `list_repos()` / `list_template_repos()` as views over that one
-  cached walk, `list_owners()` (login + orgs, for "who owns the new repo"),
+  cached walk, `refresh_cache()` (gh has no cache-invalidate command, but an
+  entry older than the request's `--cache` TTL is refetched *and rewritten*, so
+  it re-runs the identical repo/owner requests with `REFRESH_TTL = "1s"` and the
+  next `CACHE_TTL` read sees fresh data — `--cache 0` would instead bypass the
+  cache and leave the stale entry in place), `list_owners()` (login + orgs, for "who owns the new repo"),
   `create_repo()` (`gh repo create`, optionally `--template`), `has_commits()` /
   `wait_for_commits()` (poll a freshly generated repo until GitHub finishes
   copying the template in), `clone_url()` (maps a picked `owner/name` to a

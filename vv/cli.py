@@ -46,6 +46,10 @@ _DELETE = object()
 # shortcut (Shift+X) instead of picking a single session to act on.
 _SWEEP = object()
 
+# Sentinel returned by the main menu when the user pressed ``r`` to refresh the
+# cached GitHub repo list instead of picking an action.
+_REFRESH = object()
+
 
 def _fail(message: str) -> "typer.Exit":
     """Print an error and return an Exit to raise."""
@@ -2020,10 +2024,49 @@ def _interactive_menu(default_agent: str, bypass: bool) -> None:
         "✦  Create a new GitHub project": _menu_new_github_project,
         "❝  Start a chat-only session (no repo)": _menu_new_chat,
     }
-    choice = questionary.select("What would you like to do?", choices=list(actions)).ask()
-    if choice is None:
+    while True:
+        question = questionary.select(
+            "What would you like to do?",
+            choices=list(actions),
+            instruction="(r: refresh GitHub repos)",
+        )
+
+        @question.application.key_bindings.add("r", eager=True)
+        def _request_refresh(event) -> None:
+            event.app.exit(result=_REFRESH)
+
+        choice = question.ask()
+        if choice is None:
+            return
+        if choice is _REFRESH:
+            _refresh_github_repos()
+            continue
+        actions[choice](default_agent, bypass)
         return
-    actions[choice](default_agent, bypass)
+
+
+def _refresh_github_repos() -> None:
+    """Drop gh's cached repo/owner lists by refetching them from GitHub now.
+
+    The repo and template pickers serve ``gh``'s one-hour cache, so a repo
+    created (or an org joined) in that window is invisible until it expires.
+    """
+    if not gh_ops.is_available():
+        typer.secho(
+            "gh is not installed or not logged in — nothing to refresh.",
+            fg=typer.colors.YELLOW,
+        )
+        return
+    typer.secho("Refreshing your GitHub repositories...", fg=typer.colors.CYAN)
+    repos = gh_ops.refresh_cache()
+    if repos:
+        plural = "" if len(repos) == 1 else "s"
+        typer.secho(f"Found {len(repos)} repo{plural}.", fg=typer.colors.GREEN)
+    else:
+        typer.secho(
+            "Couldn't fetch your repos from GitHub — kept the cached list.",
+            fg=typer.colors.YELLOW,
+        )
 
 
 @app.command()

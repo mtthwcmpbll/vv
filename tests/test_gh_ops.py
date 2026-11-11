@@ -87,6 +87,24 @@ def test_list_repos_detailed_defaults_missing_flag_to_false(monkeypatch):
     assert gh_ops.list_repos_detailed() == [("a/one", False)]
 
 
+def test_refresh_cache_refetches_repos_and_owners_with_short_ttl(monkeypatch):
+    """Same requests as the cached reads (same cache keys), but a near-zero TTL."""
+    calls = _stub_run(monkeypatch, _completed(stdout="a/one\tfalse\n"))
+    assert gh_ops.refresh_cache() == [("a/one", False)]
+    endpoints = [next(a for a in c if a.startswith("user")) for c in calls]
+    assert endpoints == ["user/repos", "user", "user/orgs"]
+    for call in calls:
+        assert call[call.index("--cache") + 1] == gh_ops.REFRESH_TTL
+
+
+def test_cached_reads_use_the_normal_ttl(monkeypatch):
+    calls = _stub_run(monkeypatch, _completed(stdout="a/one\tfalse\n"))
+    gh_ops.list_repos()
+    gh_ops.list_owners()
+    for call in calls:
+        assert call[call.index("--cache") + 1] == gh_ops.CACHE_TTL
+
+
 # --- list_template_repos ----------------------------------------------------
 
 def test_list_template_repos_filters_to_templates(monkeypatch):

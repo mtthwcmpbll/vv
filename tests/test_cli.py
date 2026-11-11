@@ -1213,18 +1213,89 @@ def test_new_project_creation_failure_propagates(new_project_harness):
     assert "url" not in seen
 
 
-def test_new_project_is_in_the_main_menu(monkeypatch):
-    """The action is offered, and sits directly under 'Add a new repo'."""
+class _MenuQuestion(_Answer):
+    """A canned main-menu prompt that records the key bindings vv adds to it."""
+
+    def __init__(self, answer):
+        super().__init__(answer)
+        self.bindings: dict[str, object] = {}
+        bindings = self.bindings
+
+        class _KeyBindings:
+            def add(self, key, **_kwargs):
+                return lambda handler: bindings.setdefault(key, handler)
+
+        self.application = type("App", (), {"key_bindings": _KeyBindings()})()
+
+
+@pytest.fixture
+def main_menu(monkeypatch):
+    """Answer successive main-menu prompts in order; returns the prompts shown."""
     monkeypatch.setattr(cli, "_banner", lambda: None)
-    labels: list[str] = []
-    monkeypatch.setattr(
-        cli.questionary, "select",
-        lambda _m, choices: labels.extend(choices) or _Answer(None),
-    )
+    shown: list[tuple[list[str], _MenuQuestion]] = []
+
+    def install(*answers):
+        queue = list(answers)
+
+        def fake_select(_message, choices, **_kwargs):
+            question = _MenuQuestion(queue.pop(0))
+            shown.append((list(choices), question))
+            return question
+
+        monkeypatch.setattr(cli.questionary, "select", fake_select)
+        return shown
+
+    return install
+
+
+def test_new_project_is_in_the_main_menu(main_menu):
+    """The action is offered, and sits directly under 'Add a new repo'."""
+    shown = main_menu(None)
     cli._interactive_menu("claude", bypass=True)
+    labels = shown[0][0]
     matches = [i for i, label in enumerate(labels) if "GitHub project" in label]
     assert matches, labels
     assert "Add a new repo" in labels[matches[0] - 1]
+
+
+def test_main_menu_binds_r_to_refresh(main_menu):
+    shown = main_menu(None)
+    cli._interactive_menu("claude", bypass=True)
+    question = shown[0][1]
+    assert "r" in question.bindings
+
+    exited: dict = {}
+    event = type("E", (), {"app": type("A", (), {
+        "exit": lambda self, result: exited.setdefault("result", result),
+    })()})()
+    question.bindings["r"](event)
+    assert exited["result"] is cli._REFRESH
+
+
+def test_main_menu_refresh_redraws_the_menu(main_menu, monkeypatch):
+    """Refreshing doesn't leave vv — the menu comes straight back."""
+    shown = main_menu(cli._REFRESH, None)
+    refreshed: list[bool] = []
+    monkeypatch.setattr(cli, "_refresh_github_repos", lambda: refreshed.append(True))
+    cli._interactive_menu("claude", bypass=True)
+    assert refreshed == [True]
+    assert len(shown) == 2
+
+
+def test_refresh_github_repos_refetches_when_gh_is_available(monkeypatch, capsys):
+    monkeypatch.setattr(cli.gh_ops, "is_available", lambda: True)
+    monkeypatch.setattr(cli.gh_ops, "refresh_cache", lambda: [("a/one", False)])
+    cli._refresh_github_repos()
+    assert "Found 1 repo." in capsys.readouterr().out
+
+
+def test_refresh_github_repos_skips_without_gh(monkeypatch, capsys):
+    monkeypatch.setattr(cli.gh_ops, "is_available", lambda: False)
+    monkeypatch.setattr(
+        cli.gh_ops, "refresh_cache", lambda: pytest.fail("should not call gh")
+    )
+    cli._refresh_github_repos()
+    assert "nothing to refresh" in capsys.readouterr().out
 
 
 def test_prompt_repo_name_rejects_invalid_names(monkeypatch):

@@ -30,6 +30,16 @@ PR_TIMEOUT_SECONDS = 6.0
 CONTENT_TIMEOUT_SECONDS = 30.0
 CONTENT_POLL_SECONDS = 1.0
 
+#: How long ``gh`` may serve the repo/owner discovery calls from its cache.
+CACHE_TTL = "1h"
+
+#: The TTL :func:`refresh_cache` passes to force a refetch. ``gh`` has no
+#: "invalidate" command, but a cached entry older than the TTL is refetched and
+#: *rewritten* — so walking with a near-zero TTL replaces the cached responses,
+#: and the next ``CACHE_TTL`` read gets the fresh data. (``0`` would disable the
+#: cache outright, leaving the stale entry in place.)
+REFRESH_TTL = "1s"
+
 
 class GhError(RuntimeError):
     """A ``gh`` invocation that vv cannot degrade around (repo creation)."""
@@ -51,7 +61,7 @@ def is_available() -> bool:
     return result.returncode == 0
 
 
-def list_repos_detailed() -> list[tuple[str, bool]]:
+def list_repos_detailed(*, cache: str = CACHE_TTL) -> list[tuple[str, bool]]:
     """Return ``(owner/name, is_template)`` for every repo the user can access.
 
     Backed by the ``user/repos`` API endpoint, which spans the user's own
@@ -63,14 +73,15 @@ def list_repos_detailed() -> list[tuple[str, bool]]:
     Responses are cached by ``gh`` for an hour (``--cache``): walking every page
     of a large account is slow, so the first menu open pays for it and the rest
     are instant. A repo created in that window won't appear until the cache
-    expires — use "Enter a clone URL" for those. ``--jq`` is applied client-side
+    expires (or :func:`refresh_cache` is run — ``r`` on the main menu); "Enter a
+    clone URL" also reaches it. ``--jq`` is applied client-side
     to the cached response, so :func:`list_repos` and :func:`list_template_repos`
     share this one cache entry rather than each paying for their own walk.
     """
     try:
         result = subprocess.run(
             [
-                "gh", "api", "--paginate", "--cache", "1h",
+                "gh", "api", "--paginate", "--cache", cache,
                 "-X", "GET", "user/repos",
                 "-f", "per_page=100",
                 "-f", "sort=full_name",
@@ -106,20 +117,34 @@ def list_template_repos() -> list[str]:
     return [name for name, is_template in list_repos_detailed() if is_template]
 
 
-def list_owners() -> list[str]:
+def list_owners(*, cache: str = CACHE_TTL) -> list[str]:
     """Return the accounts the user can create a repo under, personal first.
 
     That is their own login followed by each organization they belong to
     (sorted). Degrades to ``[]`` if ``gh`` cannot answer — the caller then has
     no owner to offer and abandons the flow.
     """
-    login = _api_lines(["-X", "GET", "user", "--jq", ".login"], cache="1h")
+    login = _api_lines(["-X", "GET", "user", "--jq", ".login"], cache=cache)
     orgs = _api_lines(
         ["--paginate", "-X", "GET", "user/orgs", "-f", "per_page=100", "--jq", ".[].login"],
-        cache="1h",
+        cache=cache,
     )
     owners = [o for o in sorted(set(orgs)) if o and o not in login]
     return [*login, *owners]
+
+
+def refresh_cache() -> list[tuple[str, bool]]:
+    """Refetch the cached repo and owner lists from GitHub, replacing gh's cache.
+
+    Re-runs the exact requests :func:`list_repos_detailed` and
+    :func:`list_owners` make (same URLs, so the same cache keys) with
+    :data:`REFRESH_TTL`, which forces each to hit the API and overwrite its
+    entry. Returns the fresh repo list — ``[]`` if gh couldn't answer, in which
+    case the old cache is left as it was.
+    """
+    repos = list_repos_detailed(cache=REFRESH_TTL)
+    list_owners(cache=REFRESH_TTL)
+    return repos
 
 
 def _api_lines(args: list[str], *, cache: str | None = None) -> list[str]:
