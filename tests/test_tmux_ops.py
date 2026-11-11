@@ -195,3 +195,28 @@ def test_run_raises_tmux_error_on_command_failure(monkeypatch):
     monkeypatch.setattr(subprocess, "run", boom)
     with pytest.raises(tmux_ops.TmuxError, match="boom"):
         tmux_ops._run(["kill-server"])
+
+
+# --- current_session --------------------------------------------------------
+
+def test_current_session_is_none_outside_tmux(monkeypatch):
+    monkeypatch.delenv("TMUX", raising=False)
+    monkeypatch.delenv("TMUX_PANE", raising=False)
+    calls = _stub_run(monkeypatch, _completed(stdout="falcon\n"))
+    assert tmux_ops.current_session() is None
+    assert calls == []
+
+
+def test_current_session_asks_about_our_own_pane(monkeypatch):
+    monkeypatch.setenv("TMUX", "/tmp/tmux-501/default,1,0")
+    monkeypatch.setenv("TMUX_PANE", "%7")
+    calls = _stub_run(monkeypatch, _completed(stdout="falcon\n"))
+    assert tmux_ops.current_session() == "falcon"
+    assert calls[0][calls[0].index("-t") + 1] == "%7"
+
+
+def test_current_session_degrades_to_none_on_failure(monkeypatch):
+    monkeypatch.setenv("TMUX", "/tmp/tmux-501/default,1,0")
+    monkeypatch.setenv("TMUX_PANE", "%7")
+    _stub_run(monkeypatch, _completed(returncode=1))
+    assert tmux_ops.current_session() is None

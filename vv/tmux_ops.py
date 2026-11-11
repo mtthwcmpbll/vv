@@ -77,6 +77,25 @@ def session_exists(name: str) -> bool:
     return result.returncode == 0
 
 
+def current_session() -> str | None:
+    """Return the tmux session this process is running inside, or ``None``.
+
+    Asks about ``$TMUX_PANE`` (the pane tmux started us in) rather than the
+    client's current session, which may have been switched elsewhere since.
+    """
+    pane = os.environ.get("TMUX_PANE")
+    if not os.environ.get("TMUX") or not pane:
+        return None
+    result = _run(
+        ["display-message", "-p", "-t", pane, "#{session_name}"],
+        capture=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
 def kill_session(name: str) -> None:
     """Kill session ``name``; no error if it is already gone."""
     _run(["kill-session", "-t", f"={name}"], capture=True, check=False)

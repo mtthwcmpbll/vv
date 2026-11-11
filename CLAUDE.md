@@ -73,6 +73,20 @@ A sixth likewise starts nothing: **`vv --skills`** → `cli._install_skills()`
 copies vv's bundled agent skills into every agent tool on this machine and exits
 (see "Bundled skills" below).
 
+A seventh deletes one: **`vv --rm`** → `cli._remove_current_session()` deletes
+the session the cwd is inside (or `--name NAME`, resolved by the same
+`_target_session()` as `--title`/`--label`) through `_delete_session()` — the
+same warn-on-uncommitted/unpushed confirm and teardown as `x` in the session
+list — and, like annotating, never routes through remote mode. It first
+`os.chdir`s to `$HOME` (off the directory it is deleting). The ordering is the
+subtle part: it usually runs *inside* the session's own tmux session
+(`tmux_ops.current_session()`, asked of `$TMUX_PANE`), and the menu's
+kill-tmux-first would kill vv before anything was removed — so that session is
+left out of `live` and killed **last**, which also closes the shell and drops
+the client back to wherever vv was launched. Run from outside that tmux session
+it can't move the caller's shell (a child process can't), so it prints a
+`cd ~` hint instead.
+
 `_menu_add_repo()` shows a scrollable `questionary.select` of every GitHub repo
 the user can access (`_pick_github_repo()`) when `gh_ops.is_available()` (gh on PATH
 and logged in). `/` filters the `owner/name` list by **substring** (see

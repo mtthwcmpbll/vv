@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import string
@@ -588,6 +589,61 @@ def _find_session(name: str) -> tuple[str, str, Path] | None:
     return None
 
 
+def _target_session(name: str | None) -> tuple[str, str, Path]:
+    """Resolve the session a command acts on: ``--name NAME``, else the cwd's.
+
+    Raises a CLI failure when neither resolves — acting on a guessed session
+    would be worse than refusing.
+    """
+    if name:
+        session = _find_session(name)
+        if session is None:
+            raise _fail(f"no session named '{name}'")
+        return session
+    session = _session_from_cwd()
+    if session is None:
+        raise _fail(
+            "not inside a vv session — run this from a session, or pass --name NAME"
+        )
+    return session
+
+
+def _remove_current_session(name: str | None) -> None:
+    """Delete the session you are in (or ``--name NAME``) — ``vv --rm``.
+
+    Same warnings and teardown as deleting it from the session list. Two
+    differences, both because this usually runs *inside* the session:
+
+    - vv first moves its own cwd to ``$HOME``, off the directory it deletes.
+    - When vv is running in the session's own tmux session, killing that first
+      (as the menu does) would kill vv along with it before anything was
+      removed. So it is left out of ``live`` and killed *last*, once the
+      worktree, branch and notes are gone. That also takes the shell with it,
+      and the tmux client returns to the terminal vv was launched from.
+    """
+    repo, session_name, path = _target_session(name)
+    from_cwd = name is None
+    os.chdir(Path.home())
+
+    inside = tmux_ops.current_session() == session_name
+    live = set(tmux_ops.list_sessions())
+    if inside:
+        live.discard(session_name)
+
+    if not _delete_session(repo, session_name, path, live):
+        return
+    if inside:
+        typer.secho("Closing this session's tmux session...", fg=typer.colors.CYAN)
+        tmux_ops.kill_session(session_name)
+    elif from_cwd:
+        # A child process can't move its parent shell; say so rather than
+        # leave the user puzzling over a vanished cwd.
+        typer.secho(
+            "Your shell is still in the deleted directory — run `cd ~`.",
+            fg=typer.colors.YELLOW,
+        )
+
+
 def _apply_notes(pending: notes.Pending, name: str | None) -> None:
     """Set the title and/or labels on an existing session.
 
@@ -596,18 +652,7 @@ def _apply_notes(pending: notes.Pending, name: str | None) -> None:
     just annotate it. Each label spec adds a label, or removes it when prefixed
     with ``-``; a blank title clears the title.
     """
-    if name:
-        session = _find_session(name)
-        if session is None:
-            raise _fail(f"no session named '{name}'")
-    else:
-        session = _session_from_cwd()
-        if session is None:
-            raise _fail(
-                "not inside a vv session — run this from a session, or pass --name NAME"
-            )
-
-    repo, session_name, _path = session
+    repo, session_name, _path = _target_session(name)
     if pending.title is not None:
         title = notes.set_title(repo, session_name, pending.title)
         typer.secho(
@@ -2138,6 +2183,13 @@ def main(
         help="Install vv's bundled agent skills (the `pr` skill) into every "
         "supported agent tool found on this machine, then exit.",
     ),
+    rm: bool = typer.Option(
+        False,
+        "--rm",
+        help="Delete the session you are in (or --name NAME) — worktree, "
+        "branch, notes and tmux session — then exit. Warns first if it holds "
+        "uncommitted or unpushed work, like deleting it from the session list.",
+    ),
     emit_cwd: str = typer.Option(
         None,
         "--emit-cwd",
@@ -2178,6 +2230,14 @@ def main(
             return
 
         pending_notes = notes.Pending(title=title, label_specs=tuple(label or []))
+
+        # Deleting a session is local for the same reason annotating one is
+        # (below): inside a remote session you are already running the remote vv.
+        if rm:
+            if repo_url or chat or pending_notes:
+                raise _fail("--rm cannot be combined with a repo URL, --chat, --title or --label")
+            _remove_current_session(name)
+            return
 
         # Annotating an *existing* session is pure local bookkeeping on the
         # machine whose sessions they are, so it never routes through remote

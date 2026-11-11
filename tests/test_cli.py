@@ -6,6 +6,8 @@ no real clone/worktree/tmux work happens.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from typer.testing import CliRunner
 
@@ -2208,3 +2210,110 @@ def test_start_from_url_clones_a_same_name_repo_into_its_own_dir(
 
     assert cloned["dest"] == workspaces / "moderneinc-rewrite-prethink"
     assert started["repo"] == "moderneinc-rewrite-prethink"
+
+
+# --- vv --rm ----------------------------------------------------------------
+
+@pytest.fixture
+def rm_env(notes_env, monkeypatch, tmp_path):
+    """``notes_env`` sessions with deletion and tmux stubbed; records the calls."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    calls: dict = {"deleted": [], "killed": [], "home": home, "cwd_at_delete": None}
+
+    state = {"current": None, "live": [], "confirm": True}
+
+    def fake_delete(repo, name, path, live):
+        calls["deleted"].append((repo, name, path, set(live)))
+        calls["cwd_at_delete"] = Path.cwd()
+        return state["confirm"]
+
+    monkeypatch.setattr(cli, "_delete_session", fake_delete)
+    monkeypatch.setattr(cli.tmux_ops, "current_session", lambda: state["current"])
+    monkeypatch.setattr(cli.tmux_ops, "list_sessions", lambda **_k: list(state["live"]))
+    monkeypatch.setattr(cli.tmux_ops, "kill_session", calls["killed"].append)
+
+    def configure(*, current=None, live=(), confirm=True):
+        state.update(current=current, live=list(live), confirm=confirm)
+        return calls
+
+    return configure
+
+
+def test_rm_deletes_the_session_the_cwd_is_inside(rm_env, notes_env, monkeypatch):
+    calls = rm_env()
+    monkeypatch.chdir(notes_env / ".")
+    result = runner.invoke(cli.app, ["--rm"])
+    assert result.exit_code == 0, result.output
+    assert [(r, n) for r, n, _p, _l in calls["deleted"]] == [("repo", "alpha")]
+
+
+def test_rm_moves_to_home_before_deleting(rm_env, notes_env, monkeypatch):
+    calls = rm_env()
+    monkeypatch.chdir(notes_env)
+    runner.invoke(cli.app, ["--rm"])
+    assert calls["cwd_at_delete"].resolve() == calls["home"].resolve()
+
+
+def test_rm_from_inside_its_own_tmux_session_kills_it_last(rm_env, notes_env, monkeypatch):
+    """Killing it first would kill vv before anything was removed."""
+    calls = rm_env(current="alpha", live={"alpha", "bravo"})
+    monkeypatch.chdir(notes_env)
+    result = runner.invoke(cli.app, ["--rm"])
+    assert result.exit_code == 0, result.output
+    (_repo, _name, _path, live), = calls["deleted"]
+    assert "alpha" not in live           # not killed by the delete itself...
+    assert calls["killed"] == ["alpha"]  # ...but afterwards
+
+
+def test_rm_outside_tmux_leaves_the_kill_to_the_delete(rm_env, notes_env, monkeypatch):
+    calls = rm_env(current=None, live={"alpha"})
+    monkeypatch.chdir(notes_env)
+    result = runner.invoke(cli.app, ["--rm"])
+    (_repo, _name, _path, live), = calls["deleted"]
+    assert "alpha" in live               # the normal kill-first path
+    assert calls["killed"] == []
+    assert "cd ~" in result.output       # our shell can't move the user's
+
+
+def test_rm_declined_keeps_the_tmux_session(rm_env, notes_env, monkeypatch):
+    calls = rm_env(current="alpha", live={"alpha"}, confirm=False)
+    monkeypatch.chdir(notes_env)
+    runner.invoke(cli.app, ["--rm"])
+    assert calls["killed"] == []
+
+
+def test_rm_can_target_another_session_by_name(rm_env, notes_env, tmp_path, monkeypatch):
+    calls = rm_env()
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(cli.app, ["--rm", "--name", "spark"])
+    assert result.exit_code == 0, result.output
+    assert [(r, n) for r, n, _p, _l in calls["deleted"]] == [(cli.CHATS, "spark")]
+    assert "cd ~" not in result.output
+
+
+def test_rm_outside_any_session_errors(rm_env, notes_env, tmp_path, monkeypatch):
+    calls = rm_env()
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(cli.app, ["--rm"])
+    assert result.exit_code != 0
+    assert "not inside a vv session" in result.output
+    assert calls["deleted"] == []
+
+
+def test_rm_rejects_create_flow_arguments(rm_env, notes_env, monkeypatch):
+    calls = rm_env()
+    monkeypatch.chdir(notes_env)
+    result = runner.invoke(cli.app, ["--rm", "--chat"])
+    assert result.exit_code != 0
+    assert calls["deleted"] == []
+
+
+def test_rm_never_routes_through_remote_mode(rm_env, notes_env, monkeypatch):
+    calls = rm_env()
+    monkeypatch.setattr(cli, "_launch_remote", lambda *a, **k: pytest.fail("launched"))
+    monkeypatch.chdir(notes_env)
+    result = runner.invoke(cli.app, ["--rm", "--remote"])
+    assert result.exit_code == 0, result.output
+    assert len(calls["deleted"]) == 1
